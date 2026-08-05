@@ -6,6 +6,8 @@ import type { DiscordEvent } from "./types.js";
 
 const MAX_PRELOAD_BYTES = 8 * 1024 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
+export const MAX_NDJSON_LINE_CHARACTERS = 1024 * 1024;
+const OVERSIZED_LINE_ERROR = "NDJSON line exceeds maximum length";
 
 interface FileState {
   handle: FileHandle;
@@ -14,6 +16,7 @@ interface FileState {
   decoder: StringDecoder;
   text: string;
   discardFirstLine: boolean;
+  discardOversizedLine: boolean;
 }
 
 interface OpenedFile {
@@ -43,7 +46,8 @@ function newState(opened: OpenedFile, offset = 0, discardFirstLine = false): Fil
     offset,
     decoder: new StringDecoder("utf8"),
     text: "",
-    discardFirstLine
+    discardFirstLine,
+    discardOversizedLine: false
   };
 }
 
@@ -216,6 +220,7 @@ export class EventTailer {
       state.decoder = new StringDecoder("utf8");
       state.text = "";
       state.discardFirstLine = false;
+      state.discardOversizedLine = false;
     }
     await this.#readTo(state, stats.size, broadcast);
   }
@@ -269,23 +274,37 @@ export class EventTailer {
       if (result.bytesRead === 0) break;
       state.offset += result.bytesRead;
       this.#lastReadProgressAt = Date.now();
-      state.text += state.decoder.write(buffer.subarray(0, result.bytesRead));
-      this.#consumeLines(state, broadcast);
+      this.#consumeText(state, state.decoder.write(buffer.subarray(0, result.bytesRead)), broadcast);
     }
   }
 
-  #consumeLines(state: FileState, broadcast: boolean): void {
+  #consumeText(state: FileState, text: string, broadcast: boolean): void {
+    if (state.discardFirstLine || state.discardOversizedLine) {
+      const newline = text.indexOf("\n");
+      if (newline < 0) return;
+      state.discardFirstLine = false;
+      state.discardOversizedLine = false;
+      text = text.slice(newline + 1);
+    }
+
+    state.text += text;
     let newline = state.text.indexOf("\n");
     while (newline >= 0) {
-      const line = state.text.slice(0, newline).replace(/\r$/, "");
+      const line = state.text.slice(0, newline);
       state.text = state.text.slice(newline + 1);
-      if (state.discardFirstLine) {
-        state.discardFirstLine = false;
+      if (line.length > MAX_NDJSON_LINE_CHARACTERS) {
+        this.#onError(new Error(OVERSIZED_LINE_ERROR));
       } else {
-        const event = parseEventLine(line);
+        const event = parseEventLine(line.replace(/\r$/, ""));
         if (event !== null) this.#onEvent(event, broadcast);
       }
       newline = state.text.indexOf("\n");
+    }
+
+    if (state.text.length > MAX_NDJSON_LINE_CHARACTERS) {
+      state.text = "";
+      state.discardOversizedLine = true;
+      this.#onError(new Error(OVERSIZED_LINE_ERROR));
     }
   }
 }

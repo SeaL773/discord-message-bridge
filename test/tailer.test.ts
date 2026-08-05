@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { appendFile, rename, writeFile } from "node:fs/promises";
 import { test } from "node:test";
-import { EventTailer } from "../src/tailer.js";
+import { EventTailer, MAX_NDJSON_LINE_CHARACTERS } from "../src/tailer.js";
 import type { DiscordEvent } from "../src/types.js";
 import { makeEvent, tempConfig } from "./helpers.js";
 
@@ -21,6 +21,33 @@ void test("tailer preserves partial UTF-8 lines and emits only completed events"
   assert.equal(received.length, 1);
   assert.equal(received[0]?.message["content"], "hello 🚀");
   await tailer.stop();
+});
+
+void test("tailer discards an oversized line through newline and resumes parsing", async () => {
+  const { config } = await tempConfig();
+  const received: string[] = [];
+  const errors: unknown[] = [];
+  const tailer = new EventTailer({
+    eventPath: config.eventPath,
+    pollMs: config.pollMs,
+    onEvent: (event) => received.push(event.message.id),
+    onError: (error) => errors.push(error)
+  });
+  await tailer.start();
+  try {
+    await appendFile(config.eventPath, "x".repeat(MAX_NDJSON_LINE_CHARACTERS + 1), "utf8");
+    await tailer.pollOnce();
+    assert.deepEqual(received, []);
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0] instanceof Error ? errors[0].message : null, "NDJSON line exceeds maximum length");
+
+    await appendFile(config.eventPath, `discarded-tail\n${JSON.stringify(makeEvent("after-oversized"))}\n`, "utf8");
+    await tailer.pollOnce();
+    assert.deepEqual(received, ["after-oversized"]);
+    assert.equal(errors.length, 1);
+  } finally {
+    await tailer.stop();
+  }
 });
 
 void test("tailer drains unread rotated bytes before reading replacement active file", async () => {
