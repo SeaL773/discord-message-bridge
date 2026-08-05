@@ -1,0 +1,5 @@
+node_modules/
+dist/
+bridge-token.txt
+bridge.pid
+*.log
