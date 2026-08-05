@@ -1,0 +1,2759 @@
+diff --git a/BRIDGE_PATCH_NOTICE.md b/BRIDGE_PATCH_NOTICE.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..0795105dc7d83c4f53290446bb262e88f65dd74f
+--- /dev/null
++++ b/BRIDGE_PATCH_NOTICE.md
+@@ -0,0 +1,42 @@
++# Bridge Collector Patch Modification Notice
++
++Upstream: `Syncxv/vc-message-logger-enhanced` commit `ea339bc09d7415ad0f715d60b80ba89ba2d685fa`
++
++Modifier: `SeaL773`
++
++Modification date: `2026-07-24`
++
++Purpose: adapt the GPL-3.0-or-later MessageLoggerEnhanced source into a reviewed, local-only Bridge collector with privacy-by-default opt-in, mandatory validated channel scoping before NDJSON writes, serialized/rotated integration journals, permission-independent channel/thread context-menu historical backfill with local-only feedback, an optional slash-command trigger, full privacy filtering and retryable CREATED-journal markers, complete local Clear All semantics, current Vencord compatibility, safer embed normalization, and removal of the third-party updater. Upstream copyright and license notices remain in place.
++
++Patch-modified paths:
++
++- `BRIDGE_PATCH_NOTICE.md` (this manifest)
++- `LoggedMessageManager.ts`
++- `backfillExecution.ts` (added)
++- `backfillLifecycle.ts` (added)
++- `backfillPreparation.ts` (added)
++- `backfillPagination.ts` (added)
++- `channelCatalog.ts`
++- `components/LogsModal.tsx`
++- `components/UpdaterModal.tsx` (removed)
++- `db.ts`
++- `index.tsx`
++- `messagePersistenceCoordinator.ts` (added)
++- `native/index.ts`
++- `native/updater.ts` (removed)
++- `settings.tsx`
++- `types.ts`
++- `utils/cleanUp.ts`
++- `utils/clearAllLocalLogs.ts` (added)
++- `utils/idb/async-iterators.ts`
++- `utils/idb/database-extras.ts`
++- `utils/idb/wrap-idb-value.ts`
++- `utils/misc.ts`
++- `utils/native-file-system-adapter/types/src/adapters/sandbox.d.ts` (removed)
++- `utils/parseQuery.ts`
++- `utils/saveImage/ImageManager.ts`
++- `utils/streamparser-json/tokenizer.ts`
++- `utils/streamparser-json/tokenparser.ts`
++- `utils/updater.tsx` (removed)
++
++This notice does not replace the upstream `LICENSE` or source-file notices.
+diff --git a/LoggedMessageManager.ts b/LoggedMessageManager.ts
+index e83a30e6147ec31a2f6055100c46c5c8dbec7723..84e8bc783342f6c740512a4371013d695419b1d4 100644
+--- a/LoggedMessageManager.ts
++++ b/LoggedMessageManager.ts
+@@ -1,44 +1,140 @@
+ /*
+- * Vencord, a modification for Discord's desktop app
++ * Vencord, a Discord client mod
+  * Copyright (c) 2023 Vendicated and contributors
+- *
+- * This program is free software: you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation, either version 3 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-*/
+-
+-import { Flogger, settings } from ".";
+-import { addMessageIDB, db, DBMessageStatus, deleteMessagesBulkIDB, getOldestMessagesIDB } from "./db";
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++// Modified 2026-07-24 by SeaL773: emit scoped integration events, preserve a
++// durable CREATED-journal marker, and serialize all lifecycle writes per ID.
++
++import { Flogger, Native, settings } from ".";
++import { getRequestedEventNames } from "./channelCatalog";
++import { addMessageIDB, db, DBMessageStatus, deleteMessagesBulkIDB, getOldestMessagesIDB, hasCreatedEventIDB, markCreatedEventIDB } from "./db";
++import { createMessagePersistenceCoordinator } from "./messagePersistenceCoordinator";
+ import { LoggedMessage, LoggedMessageJSON } from "./types";
+ import { cleanupMessage } from "./utils";
+ import { cacheMessageImages } from "./utils/saveImage";
+ 
++const persistenceCoordinator = createMessagePersistenceCoordinator();
++
++export interface HistoricalPersistenceResult {
++    alreadyPresent: number;
++    persisted: number;
++    interrupted: boolean;
++}
++
++async function enforceMessageLimit() {
++    if (settings.store.messageLimit <= 0)
++        return;
++
++    const currentMessageCount = await db.count("messages");
++    if (currentMessageCount > settings.store.messageLimit) {
++        const messagesToDelete = currentMessageCount - settings.store.messageLimit;
++        if (messagesToDelete <= 0 || messagesToDelete >= settings.store.messageLimit) return;
++
++        const oldestMessages = await getOldestMessagesIDB(messagesToDelete);
++
++        Flogger.info(`Deleting ${messagesToDelete} oldest messages`);
++        await deleteMessagesBulkIDB(oldestMessages.map(m => m.message_id));
++    }
++}
++
++async function appendCreatedEvent(message: LoggedMessageJSON, capturedAt: string) {
++    const eventNames = getRequestedEventNames(message.channel_id);
++    if (eventNames == null)
++        return false;
++
++    await Native.appendLogEvent(JSON.stringify({
++        schema_version: 1,
++        event_type: DBMessageStatus.CREATED,
++        captured_at: capturedAt,
++        ...eventNames,
++        message
++    }));
++    return true;
++}
++
++async function commitCreatedMessage(
++    message: LoggedMessageJSON,
++    capturedAt: string,
++    shouldContinue: () => boolean,
++    storeUnmarkedOnFailure: boolean
++) {
++    return persistenceCoordinator.commitCreated({
++        messageId: message.id,
++        canAppend: () => shouldContinue() && getRequestedEventNames(message.channel_id) != null,
++        hasCreatedEvent: () => hasCreatedEventIDB(message.id),
++        appendCreated: async () => {
++            if (!await appendCreatedEvent(message, capturedAt))
++                throw new Error("Channel left the active Bridge allowlist before CREATED append.");
++        },
++        markCreatedEvent: () => markCreatedEventIDB(message),
++        ...(storeUnmarkedOnFailure ? {
++            storeUnmarked: () => addMessageIDB(message, DBMessageStatus.CREATED),
++            storeWhenCannotAppend: true
++        } : {})
++    });
++}
++
+ export const addMessage = async (message: LoggedMessage | LoggedMessageJSON, status: DBMessageStatus) => {
+     if (settings.store.saveImages && status === DBMessageStatus.DELETED)
+         await cacheMessageImages(message);
+     const finalMessage = cleanupMessage(message);
+ 
+-    await addMessageIDB(finalMessage, status);
++    if (status === DBMessageStatus.CREATED) {
++        try {
++            await commitCreatedMessage(finalMessage, finalMessage.timestamp, () => true, true);
++        } catch {
++            Flogger.error("Failed to append CREATED message event", { code: "created_event_append_failed" });
++        }
++        await enforceMessageLimit();
++        return;
++    }
++
++    await persistenceCoordinator.runExclusive(finalMessage.id, async () => {
++        await addMessageIDB(finalMessage, status);
+ 
+-    if (settings.store.messageLimit > 0) {
+-        const currentMessageCount = await db.count("messages");
+-        if (currentMessageCount > settings.store.messageLimit) {
+-            const messagesToDelete = currentMessageCount - settings.store.messageLimit;
+-            if (messagesToDelete <= 0 || messagesToDelete >= settings.store.messageLimit) return;
++        const eventNames = getRequestedEventNames(finalMessage.channel_id);
++        if (eventNames != null) {
++            try {
++                await Native.appendLogEvent(JSON.stringify({
++                    schema_version: 1,
++                    event_type: status,
++                    captured_at: new Date().toISOString(),
++                    ...eventNames,
++                    message: finalMessage
++                }));
++            } catch {
++                Flogger.error("Failed to append message event", { code: "lifecycle_event_append_failed" });
++            }
++        }
+ 
+-            const oldestMessages = await getOldestMessagesIDB(messagesToDelete);
++        await enforceMessageLimit();
++    });
++};
+ 
+-            Flogger.info(`Deleting ${messagesToDelete} oldest messages`);
+-            await deleteMessagesBulkIDB(oldestMessages.map(m => m.message_id));
++export async function persistHistoricalCreatedMessages(
++    messages: readonly { message: LoggedMessageJSON; capturedAt: string; }[],
++    shouldContinue: () => boolean
++): Promise<HistoricalPersistenceResult> {
++    let alreadyPresent = 0;
++    let persisted = 0;
++
++    for (const { message, capturedAt } of messages) {
++        if (!shouldContinue())
++            return { alreadyPresent, persisted, interrupted: true };
++
++        const outcome = await commitCreatedMessage(message, capturedAt, shouldContinue, false);
++
++        if (outcome === "interrupted")
++            return { alreadyPresent, persisted, interrupted: true };
++        if (outcome === "already-journaled")
++            alreadyPresent++;
++        else {
++            persisted++;
++            await enforceMessageLimit();
+         }
+     }
+-};
++
++    return { alreadyPresent, persisted, interrupted: false };
++}
+diff --git a/backfillExecution.ts b/backfillExecution.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6e360cf231bcd80fd5a70fdd135f48a7837088a
+--- /dev/null
++++ b/backfillExecution.ts
+@@ -0,0 +1,40 @@
++/*
++ * Vencord, a Discord client mod
++ * Copyright (c) 2024 Vendicated and contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++// Modified 2026-07-24 by SeaL773: share safe local feedback mapping between
++// context-menu and slash-command historical backfill triggers.
++
++export interface BackfillExecutionResult {
++    ok: boolean;
++    message: string;
++}
++
++const SAFE_BACKFILL_FAILURES = new Set([
++    "MessageLoggerEnhanced is stopping or not started.",
++    "Enable created-message persistence before running backfill.",
++    "This channel is not in the active Bridge channel-catalog allowlist.",
++    "A backfill is already running for this channel.",
++    "count must be an integer from 1 to 5000"
++]);
++
++export async function runBackfillExecution(
++    channelId: string,
++    requestedCount: unknown,
++    validateCount: (value: unknown) => number,
++    execute: (targetChannelId: string, count: number) => Promise<string>,
++    logError: (code: "backfill_failed") => void
++): Promise<BackfillExecutionResult> {
++    try {
++        const count = validateCount(requestedCount);
++        return { ok: true, message: await execute(channelId, count) };
++    } catch (error) {
++        logError("backfill_failed");
++        const safeDetail = error instanceof Error && SAFE_BACKFILL_FAILURES.has(error.message)
++            ? ` ${error.message}`
++            : "";
++        return { ok: false, message: `Backfill failed.${safeDetail}` };
++    }
++}
+diff --git a/backfillLifecycle.ts b/backfillLifecycle.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..120944d53a2b61b21e2adea66917d81e0c94b6bd
+--- /dev/null
++++ b/backfillLifecycle.ts
+@@ -0,0 +1,55 @@
++/*
++ * Vencord, a Discord client mod
++ * Copyright (c) 2024 Vendicated and contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++// Modified 2026-07-24 by SeaL773: permanently invalidate historical backfills
++// across plugin stop/start boundaries while allowing safe restart.
++
++export interface BackfillLease {
++    channelId: string;
++    generation: number;
++    token: symbol;
++}
++
++export function createBackfillLifecycle() {
++    const active = new Map<string, symbol>();
++    let generation = 0;
++    let started = false;
++
++    return {
++        start() {
++            generation++;
++            started = true;
++        },
++
++        stop() {
++            generation++;
++            started = false;
++            active.clear();
++        },
++
++        begin(channelId: string): BackfillLease {
++            if (!started)
++                throw new Error("MessageLoggerEnhanced is stopping or not started.");
++            if (active.has(channelId))
++                throw new Error("A backfill is already running for this channel.");
++
++            const token = Symbol(channelId);
++            active.set(channelId, token);
++            return { channelId, generation, token };
++        },
++
++        isCurrent(lease: BackfillLease) {
++            return started
++                && lease.generation === generation
++                && active.get(lease.channelId) === lease.token;
++        },
++
++        finish(lease: BackfillLease) {
++            if (active.get(lease.channelId) === lease.token)
++                active.delete(lease.channelId);
++        }
++    };
++}
+diff --git a/backfillPagination.ts b/backfillPagination.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..38f12472696fb824e119996bc07aa4feebf4a754
+--- /dev/null
++++ b/backfillPagination.ts
+@@ -0,0 +1,95 @@
++/*
++ * Vencord, a Discord client mod
++ * Copyright (c) 2024 Vendicated and contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++// Modified 2026-07-24 by SeaL773: add deterministic, bounded pagination for
++// user-triggered historical Bridge collection.
++
++export const DEFAULT_BACKFILL_COUNT = 100;
++export const MIN_BACKFILL_COUNT = 1;
++export const MAX_BACKFILL_COUNT = 5000;
++export const MAX_BACKFILL_PAGE_SIZE = 100;
++
++export interface BackfillPageRequest {
++    limit: number;
++    before?: string;
++}
++
++export interface BackfillPaginationResult<T> {
++    entries: T[];
++    examined: number;
++    historyEnded: boolean;
++}
++
++export function validateBackfillCount(value: unknown): number {
++    if (typeof value !== "number" || !Number.isInteger(value) || value < MIN_BACKFILL_COUNT || value > MAX_BACKFILL_COUNT)
++        throw new Error(`count must be an integer from ${MIN_BACKFILL_COUNT} to ${MAX_BACKFILL_COUNT}`);
++
++    return value;
++}
++
++function readMessageId(value: unknown): string {
++    if (typeof value !== "object" || value === null || !("id" in value))
++        throw new Error("history entry is missing an id");
++
++    const { id } = value;
++    if (typeof id !== "string" || !/^\d+$/.test(id))
++        throw new Error("history entry has a malformed id");
++
++    return id;
++}
++
++export async function paginateBackfill<T>(
++    requestedCount: number,
++    fetchPage: (request: BackfillPageRequest) => Promise<readonly T[]>,
++    afterPage?: () => void
++): Promise<BackfillPaginationResult<T>> {
++    const count = validateBackfillCount(requestedCount);
++    const entries: T[] = [];
++    const seenIds = new Set<string>();
++    const seenCursors = new Set<string>();
++    let examined = 0;
++    let before: string | undefined;
++    let historyEnded = false;
++
++    while (examined < count) {
++        const limit = Math.min(MAX_BACKFILL_PAGE_SIZE, count - examined);
++        const rawPage = await fetchPage(before == null ? { limit } : { limit, before });
++        if (!Array.isArray(rawPage))
++            throw new Error("history response body must be an array");
++        if (rawPage.length > limit)
++            throw new Error("history response exceeded the requested page limit");
++
++        const page = rawPage.slice();
++        examined += page.length;
++
++        if (page.length === 0) {
++            historyEnded = true;
++            afterPage?.();
++            break;
++        }
++
++        for (const entry of page) {
++            const id = readMessageId(entry);
++            if (!seenIds.has(id)) {
++                seenIds.add(id);
++                entries.push(entry);
++            }
++        }
++
++        const nextBefore = readMessageId(page[page.length - 1]);
++        if (seenCursors.has(nextBefore) || (before != null && BigInt(nextBefore) >= BigInt(before)))
++            throw new Error("history cursor did not advance");
++
++        seenCursors.add(nextBefore);
++        before = nextBefore;
++        historyEnded = page.length < limit;
++        afterPage?.();
++        if (historyEnded)
++            break;
++    }
++
++    return { entries, examined, historyEnded };
++}
+diff --git a/backfillPreparation.ts b/backfillPreparation.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7739e9958e931d56aca3e49d70e3a998b85f22c5
+--- /dev/null
++++ b/backfillPreparation.ts
+@@ -0,0 +1,53 @@
++/*
++ * Vencord, a Discord client mod
++ * Copyright (c) 2024 Vendicated and contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++// Modified 2026-07-24 by SeaL773: enforce the created-message privacy gate and
++// normalize a complete historical batch before persistence can begin.
++
++export interface FetchedBackfillBatch<T> {
++    entries: readonly T[];
++    examined: number;
++    historyEnded: boolean;
++}
++
++export interface PreparedBackfillEntry<T> {
++    message: T;
++    capturedAt: string;
++}
++
++export interface PreparedBackfillBatch<T> {
++    entries: PreparedBackfillEntry<T>[];
++    examined: number;
++    unique: number;
++    ignored: number;
++    historyEnded: boolean;
++}
++
++export async function fetchAndPrepareBackfill<TRaw, TClean>(
++    persistCreatedMessages: boolean,
++    fetchBatch: () => Promise<FetchedBackfillBatch<TRaw>>,
++    normalize: (raw: TRaw) => TClean,
++    getTimestamp: (raw: TRaw) => string,
++    shouldIgnore: (message: TClean) => boolean
++): Promise<PreparedBackfillBatch<TClean>> {
++    if (!persistCreatedMessages)
++        throw new Error("Created-message persistence must be enabled before backfill.");
++
++    const fetched = await fetchBatch();
++    const normalized = fetched.entries.map(raw => ({
++        message: normalize(raw),
++        capturedAt: getTimestamp(raw)
++    }));
++    const entries = normalized.filter(entry => !shouldIgnore(entry.message));
++
++    return {
++        entries,
++        examined: fetched.examined,
++        unique: fetched.entries.length,
++        ignored: normalized.length - entries.length,
++        historyEnded: fetched.historyEnded
++    };
++}
+diff --git a/channelCatalog.ts b/channelCatalog.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1070afaa5390eef70b51d06f1e381beed2347999
+--- /dev/null
++++ b/channelCatalog.ts
+@@ -0,0 +1,189 @@
++/*
++ * Vencord, a Discord client mod
++ * Copyright (c) 2024 Vendicated and contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++// Modified 2026-07-20 by SeaL773: add a validated, privacy-preserving
++// channel catalog scope that acts as the mandatory NDJSON allowlist.
++
++import { ChannelType } from "@vencord/discord-types/enums";
++import { ChannelStore, GuildChannelStore, GuildStore } from "@webpack/common";
++
++import { Flogger, Native } from ".";
++import { ChannelCatalogEntry, ChannelCatalogRequest, ChannelCatalogResult } from "./types";
++
++const RETRY_DELAYS = [0, 1000, 3000] as const;
++const NAME_MAX_LENGTH = 256;
++const GUILD_TEXT_CHANNEL_TYPES = new Set<ChannelType>([
++    ChannelType.GUILD_TEXT,
++    ChannelType.GUILD_ANNOUNCEMENT,
++    ChannelType.GUILD_FORUM,
++    ChannelType.GUILD_MEDIA
++]);
++
++interface ActiveChannelCatalogScope {
++    guildId: string;
++    channelIds: Set<string>;
++}
++
++export interface RequestedEventNames {
++    channel_name?: string;
++    guild_name?: string;
++}
++
++let activeScope: ActiveChannelCatalogScope | null = null;
++let refreshPromise: Promise<void> | null = null;
++
++function sleep(delay: number) {
++    return new Promise<void>(resolve => setTimeout(resolve, delay));
++}
++
++function sanitizeName(value: unknown): string | undefined {
++    if (typeof value !== "string" || value.length > NAME_MAX_LENGTH || /[\u0000-\u001f\u007f]/.test(value))
++        return undefined;
++
++    const name = value.trim();
++    return name.length > 0 ? name : undefined;
++}
++
++function getParentName(parentId: string | null | undefined, guildId: string) {
++    if (parentId == null)
++        return undefined;
++
++    const parent = ChannelStore.getChannel(parentId);
++    if (parent?.guild_id !== guildId || parent.type !== ChannelType.GUILD_CATEGORY)
++        return undefined;
++
++    return sanitizeName(parent.name);
++}
++
++function resolveSelectedChannels(request: Extract<ChannelCatalogRequest, { mode: "selected_channels"; }>) {
++    const channels: ChannelCatalogEntry[] = request.channel_ids.map(id => {
++        const channel = ChannelStore.getChannel(id);
++        if (channel == null)
++            return { id, status: "not_found" };
++        if (channel.guild_id !== request.guild_id)
++            return { id, status: "guild_mismatch" };
++
++        const name = sanitizeName(channel.name);
++        const parentName = getParentName(channel.parent_id, request.guild_id);
++        return {
++            id,
++            ...(name ? { name } : {}),
++            type: channel.type,
++            ...(parentName ? { parent_name: parentName } : {}),
++            status: "ok"
++        };
++    });
++
++    return channels;
++}
++
++function resolveGuildTextChannels(request: Extract<ChannelCatalogRequest, { mode: "guild_text_channels"; }>) {
++    const seenChannelIds = new Set<string>();
++    const channels: ChannelCatalogEntry[] = [];
++
++    for (const { channel } of GuildChannelStore.getChannels(request.guild_id).SELECTABLE) {
++        if (channel.guild_id !== request.guild_id || !GUILD_TEXT_CHANNEL_TYPES.has(channel.type) || seenChannelIds.has(channel.id))
++            continue;
++
++        const name = sanitizeName(channel.name);
++        if (name == null)
++            continue;
++
++        seenChannelIds.add(channel.id);
++        const parentName = getParentName(channel.parent_id, request.guild_id);
++        channels.push({
++            id: channel.id,
++            name,
++            type: channel.type,
++            ...(parentName ? { parent_name: parentName } : {}),
++            status: "ok"
++        });
++    }
++
++    return channels;
++}
++
++function resolveCatalog(request: ChannelCatalogRequest): ChannelCatalogResult {
++    const guild = GuildStore.getGuild(request.guild_id);
++    const channels = request.mode === "selected_channels"
++        ? resolveSelectedChannels(request)
++        : resolveGuildTextChannels(request);
++
++    const guildName = sanitizeName(guild?.name);
++    return {
++        schema_version: 1,
++        request_id: request.request_id,
++        generated_at: new Date().toISOString(),
++        guild: {
++            id: request.guild_id,
++            ...(guildName ? { name: guildName } : {})
++        },
++        channels
++    };
++}
++
++function isComplete(request: ChannelCatalogRequest, result: ChannelCatalogResult) {
++    if (result.guild.name == null)
++        return false;
++
++    return request.mode === "selected_channels"
++        ? result.channels.every(channel => channel.status !== "not_found")
++        : true;
++}
++
++async function runRefresh() {
++    const request = await Native.readChannelCatalogRequest();
++    if (request == null) {
++        activeScope = null;
++        return;
++    }
++
++    let result = resolveCatalog(request);
++    for (const delay of RETRY_DELAYS.slice(1)) {
++        if (isComplete(request, result))
++            break;
++        await sleep(delay);
++        result = resolveCatalog(request);
++    }
++
++    await Native.writeChannelCatalogResult(result);
++    activeScope = {
++        guildId: request.guild_id,
++        channelIds: new Set(result.channels.filter(channel => channel.status === "ok").map(channel => channel.id))
++    };
++}
++
++export function refreshChannelCatalog() {
++    if (refreshPromise != null)
++        return refreshPromise;
++
++    activeScope = null;
++    refreshPromise = runRefresh()
++        .catch(() => {
++            Flogger.error("Failed to refresh channel catalog", { code: "channel_catalog_refresh_failed" });
++        })
++        .finally(() => {
++            refreshPromise = null;
++        });
++    return refreshPromise;
++}
++
++export function getRequestedEventNames(channelId: string): RequestedEventNames | null {
++    const scope = activeScope;
++    if (scope == null || !scope.channelIds.has(channelId))
++        return null;
++
++    const channel = ChannelStore.getChannel(channelId);
++    if (channel?.guild_id !== scope.guildId)
++        return null;
++
++    const channelName = sanitizeName(channel.name);
++    const guildName = sanitizeName(GuildStore.getGuild(scope.guildId)?.name);
++    return {
++        ...(channelName ? { channel_name: channelName } : {}),
++        ...(guildName ? { guild_name: guildName } : {})
++    };
++}
+diff --git a/components/LogsModal.tsx b/components/LogsModal.tsx
+index 2157dd369e6a98d1be87855e699be38834faae61..78485002c8dec150caf910f051e30537ae497609 100644
+--- a/components/LogsModal.tsx
++++ b/components/LogsModal.tsx
+@@ -4,6 +4,9 @@
+  * SPDX-License-Identifier: GPL-3.0-or-later
+  */
+ 
++// Modified 2026-07-20 by SeaL773: use the current modal API and distinguish
++// full local-log clearing from IndexedDB-visible-only clearing.
++
+ import { classNameFactory } from "@api/Styles";
+ import { BaseText } from "@components/BaseText";
+ import { Button } from "@components/Button";
+@@ -11,16 +14,16 @@ import { Flex } from "@components/Flex";
+ import { InfoIcon } from "@components/Icons";
+ import { Link } from "@components/Link";
+ import { copyWithToast, openUserProfile } from "@utils/discord";
+-import { closeAllModals, ModalContent, ModalFooter, ModalHeader, ModalProps, ModalRoot, ModalSize, openModal } from "@utils/modal";
+ import { LazyComponent } from "@utils/react";
+-import type { Channel, User } from "@vencord/discord-types";
++import type { Channel, RenderModalProps, User } from "@vencord/discord-types";
+ import { find, findByCodeLazy } from "@webpack";
+-import { Alerts, ChannelStore, ContextMenuApi, FluxDispatcher, Menu, NavigationRouter, React, TabBar, TextInput, Tooltip, useMemo, useRef, useState } from "@webpack/common";
++import { Alerts, ChannelStore, closeAllModals, ContextMenuApi, FluxDispatcher, Menu, Modal, NavigationRouter, openModal, React, TabBar, TextInput, Tooltip, useMemo, useRef, useState } from "@webpack/common";
+ 
+ import { clearMessagesIDB, DBMessageRecord, deleteMessageIDB, deleteMessagesBulkIDB } from "../db";
+-import { settings } from "../index";
++import { Native, settings } from "../index";
+ import { LoggedMessage, LoggedMessageJSON } from "../types";
+ import { messageJsonToMessageClass } from "../utils";
++import { clearAllLocalLogs } from "../utils/clearAllLocalLogs";
+ import { importLogs } from "../utils/settingsUtils";
+ import { useMessages } from "./hooks";
+ 
+@@ -46,7 +49,7 @@ export enum LogTabs {
+ }
+ 
+ interface Props {
+-    modalProps: ModalProps;
++    modalProps: RenderModalProps;
+     initalQuery?: string;
+ }
+ 
+@@ -60,8 +63,8 @@ export function LogsModal({ modalProps, initalQuery }: Props) {
+     const { messages, total, statusTotal, pending, reset } = useMessages(queryEh, currentTab, sortNewest, numDisplayedMessages);
+ 
+     return (
+-        <ModalRoot className={cl("root")} {...modalProps} size={ModalSize.LARGE}>
+-            <ModalHeader className={cl("header")}>
++        <Modal {...modalProps} size="lg" title="Message Logger">
++            <div className={cl("header")}>
+                 <TextInput value={queryEh} onChange={e => setQuery(e)} style={{ width: "100%" }} placeholder="Filter Messages" />
+                 <TabBar
+                     type="top"
+@@ -94,13 +97,11 @@ export function LogsModal({ modalProps, initalQuery }: Props) {
+                         Ghost Pinged
+                     </TabBar.Item>
+                 </TabBar>
+-            </ModalHeader>
++            </div>
+             <div style={{ opacity: modalProps.transitionState === 1 ? "1" : "0" }} className={cl("content-container")} ref={contentRef}>
+                 {
+                     modalProps.transitionState === 1 &&
+-                    <ModalContent
+-                        className={cl("content")}
+-                    >
++                    <div className={cl("content")}>
+                         {messages != null && total === 0 && (
+                             <EmptyLogs
+                                 hasQuery={queryEh.length !== 0}
+@@ -118,22 +119,19 @@ export function LogsModal({ modalProps, initalQuery }: Props) {
+                                 handleLoadMore={() => setNumDisplayedMessages(e => e + settings.store.messagesToDisplayAtOnceInLogs)}
+                             />
+                         )}
+-                    </ModalContent>
++                    </div>
+                 }
+             </div>
+-            <ModalFooter className={cl("footer")}>
++            <div className={cl("footer")}>
+                 <Button
+                     variant="dangerPrimary"
+                     onClick={() => Alerts.show({
+-                        title: "Clear Logs",
+-                        body: "Are you sure you want to clear all the logs",
+-                        confirmText: "Clear",
+-                        // confirmColor: cl('danger-btn'), // changed to confirmVariant
+-                        // @ts-ignore
+-                        confirmVariant: "critical-primary",
++                        title: "Clear All Local Logs",
++                        body: "This clears MessageLoggerEnhanced IndexedDB records and both local NDJSON integration journal files. If the Bridge is running, restart the Bridge afterward to clear its in-memory replay buffer. This does not erase downstream state, Telegram messages, backups, or other copies.",
++                        confirmText: "Clear All Local Logs",
+                         cancelText: "Cancel",
+                         onConfirm: async () => {
+-                            await clearMessagesIDB();
++                            await clearAllLocalLogs(clearMessagesIDB, () => Native.clearLogEvents());
+                             reset();
+                         }
+ 
+@@ -146,12 +144,9 @@ export function LogsModal({ modalProps, initalQuery }: Props) {
+                     variant="dangerSecondary"
+                     disabled={messages?.length === 0}
+                     onClick={() => Alerts.show({
+-                        title: "Clear Logs",
+-                        body: `Are you sure you want to clear ${messages.length} logs`,
+-                        confirmText: "Clear",
+-                        // confirmColor: cl('danger-btn'),
+-                        // @ts-ignore
+-                        confirmVariant: "critical-primary",
++                        title: "Clear Visible IndexedDB Logs",
++                        body: `Clear ${messages.length} currently visible IndexedDB logs? This does not delete either NDJSON integration journal or clear the Bridge replay buffer.`,
++                        confirmText: "Clear Visible IndexedDB Logs",
+                         cancelText: "Cancel",
+                         onConfirm: async () => {
+                             await deleteMessagesBulkIDB(messages.map(e => e.message_id));
+@@ -159,7 +154,7 @@ export function LogsModal({ modalProps, initalQuery }: Props) {
+                         }
+                     })}
+                 >
+-                    Clear Visible Logs
++                    Clear Visible IndexedDB Logs
+                 </Button>
+                 <Link
+                     style={{ marginRight: "1rem" }}
+@@ -174,8 +169,8 @@ export function LogsModal({ modalProps, initalQuery }: Props) {
+                 >
+                     Sort {sortNewest ? "Oldest First" : "Newest First"}
+                 </Link>
+-            </ModalFooter>
+-        </ModalRoot>
++            </div>
++        </Modal>
+     );
+ }
+ 
+diff --git a/components/UpdaterModal.tsx b/components/UpdaterModal.tsx
+deleted file mode 100644
+index 6f158ab42a29d6712edb9be454a499ff94fdc86e..0000000000000000000000000000000000000000
+--- a/components/UpdaterModal.tsx
++++ /dev/null
+@@ -1,150 +0,0 @@
+-/*
+- * Vencord, a Discord client mod
+- * Copyright (c) 2024 Vendicated and contributors
+- * SPDX-License-Identifier: GPL-3.0-or-later
+- */
+-
+-import { classNameFactory } from "@api/Styles";
+-import { Button } from "@components/Button";
+-import { Card } from "@components/Card";
+-import { Divider } from "@components/Divider";
+-import { ErrorCard } from "@components/ErrorCard";
+-import { Flex } from "@components/Flex";
+-import { Heading } from "@components/Heading";
+-import { Link } from "@components/Link";
+-import { Paragraph } from "@components/Paragraph";
+-import { Margins } from "@utils/margins";
+-import { classes } from "@utils/misc";
+-import { ModalContent, ModalProps, ModalRoot, ModalSize, openModal } from "@utils/modal";
+-import { useAwaiter, useForceUpdater } from "@utils/react";
+-import { React, Toasts, useState } from "@webpack/common";
+-
+-import { GitError } from "../types";
+-import { changes, checkForUpdates, getRepoInfo, repoInfo as reInfo, update, updateError } from "../utils/updater";
+-
+-
+-// half of this file is just a copy of the original updater modal
+-function HashLink({ repo, longHash, disabled = false }: { repo: string, longHash: string, disabled?: boolean; }) {
+-    return <Link href={`${repo}/commit/${longHash}`} disabled={disabled}>
+-        {longHash.slice(0, 7)}
+-    </Link>;
+-}
+-
+-export function UpdateErrorCard({ updateError, title }: { updateError: GitError; title: string; }) {
+-    return (
+-        <>
+-            <Paragraph>{title}</Paragraph>
+-            <ErrorCard style={{ padding: "1em" }}>
+-                {!updateError.cmd ? (
+-                    <p>An unknown error occurred</p>
+-                ) : (
+-                    <>
+-                        <p style={{ marginTop: "4px" }}>Error occured when running: <b>{updateError.cmd}</b></p>
+-                        <code>
+-                            {updateError.message}
+-                        </code>
+-                    </>
+-                )}
+-            </ErrorCard>
+-        </>
+-    );
+-}
+-
+-const cl = classNameFactory("vc-updater-modal-");
+-export function UpdaterModal({ modalProps }: { modalProps: ModalProps; }) {
+-    const forceUpdate = useForceUpdater();
+-    const [isUpdating, setIsUpdating] = useState(false);
+-
+-    const [repoInfo, err, repoPending] = useAwaiter(getRepoInfo, { fallbackValue: reInfo });
+-    const [updates, setChanges] = useState(changes);
+-
+-    const isOutdated = (updates?.length ?? 0) > 0;
+-
+-    async function onUpdate() {
+-        setIsUpdating(true);
+-
+-        await update();
+-
+-        setIsUpdating(false);
+-    }
+-
+-    async function onCheck() {
+-        setIsUpdating(true);
+-
+-        const isOutdated = await checkForUpdates();
+-        setChanges(changes);
+-        setIsUpdating(false);
+-        forceUpdate();
+-
+-        if (!isOutdated)
+-            Toasts.show({ id: Toasts.genId(), type: Toasts.Type.MESSAGE, message: "No updates!" });
+-    }
+-
+-    return (
+-        <ModalRoot {...modalProps} size={ModalSize.LARGE}>
+-            <ModalContent className={cl("content")}>
+-                <Heading tag="h5">Repo</Heading>
+-                {!repoPending && repoInfo != null && err == null && (
+-                    <>
+-                        <Paragraph className="vc-text-selectable">
+-                            {repoPending
+-                                ? repoInfo.repo
+-                                : err
+-                                    ? "Failed to retrieve - check console"
+-                                    : (
+-                                        <Link href={repoInfo.repo}>
+-                                            {repoInfo.repo!.split("/").slice(-2).join("/")}
+-                                        </Link>
+-                                    )
+-                            }
+-                            {" "}(<HashLink longHash={repoInfo.gitHash} repo={repoInfo.repo} disabled={repoPending} />)
+-                        </Paragraph>
+-                    </>
+-                )}
+-
+-                <Divider className={Margins.top8 + " " + Margins.bottom8} />
+-                <Heading tag="h5">Updates</Heading>
+-
+-                {(updates == null || repoInfo == null) && updateError ? (
+-                    <UpdateErrorCard updateError={updateError} title="Failed to check updates. Check the console for more info" />
+-                ) : (
+-                    <Paragraph className={Margins.bottom8}>
+-                        {isOutdated ? (updates!.length === 1 ? "There is 1 Update" : `There are ${updates!.length} Updates`) : "Up to Date!"}
+-                    </Paragraph>
+-                )}
+-                {isOutdated && (
+-                    <Card style={{ padding: "0 0.5em" }}>
+-                        {updates!.map(({ hash, longHash, author, message }) => (
+-                            <div
+-                                key={longHash}
+-                                style={{
+-                                    marginTop: "0.5em",
+-                                    marginBottom: "0.5em"
+-                                }}
+-                            >
+-                                <code><HashLink repo={repoInfo?.repo!} longHash={longHash} disabled={repoPending} /></code>
+-                                <span
+-                                    style={{
+-                                        marginLeft: "0.5em",
+-                                        color: "var(--text-normal)"
+-                                    }}
+-                                >
+-                                    {message} - {author}
+-                                </span>
+-                            </div>
+-                        ))
+-                        }
+-                    </Card>
+-                )}
+-
+-                <Flex className={classes(Margins.bottom8, Margins.top8)}>
+-                    {isOutdated && <Button disabled={isUpdating} onClick={onUpdate}>Update</Button>}
+-                    <Button disabled={isUpdating} onClick={onCheck}>Check for updates</Button>
+-                </Flex>
+-            </ModalContent>
+-        </ModalRoot>
+-    );
+-}
+-
+-
+-export const openUpdaterModal = () => !IS_WEB && openModal(modalProps => <UpdaterModal modalProps={modalProps} />);
+diff --git a/db.ts b/db.ts
+index 27febd91b300e348647d65f0a7151dd3ca4f87a5..55c7640145d8b0aa65149a33e96c2bf58a8d9237 100644
+--- a/db.ts
++++ b/db.ts
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: GPL-3.0-or-later
+  */
+ 
++import { preserveCreatedJournalMarker } from "./messagePersistenceCoordinator";
+ import { LoggedMessageJSON } from "./types";
+ import { getMessageStatus } from "./utils";
+ import { DB_NAME, DB_VERSION } from "./utils/constants";
+@@ -11,6 +12,7 @@ import { DBSchema, IDBPDatabase, openDB } from "./utils/idb";
+ import { getAttachmentBlobUrl } from "./utils/saveImage";
+ 
+ export enum DBMessageStatus {
++    CREATED = "CREATED",
+     DELETED = "DELETED",
+     EDITED = "EDITED",
+     GHOST_PINGED = "GHOST_PINGED",
+@@ -21,6 +23,7 @@ export interface DBMessageRecord {
+     channel_id: string;
+     status: DBMessageStatus;
+     message: LoggedMessageJSON;
++    created_journaled?: true;
+ }
+ 
+ export interface MLIDB extends DBSchema {
+@@ -74,12 +77,17 @@ export async function initIDB() {
+         }
+     });
+ }
+-initIDB();
++const dbReady = initIDB();
+ 
+ export async function hasMessageIDB(message_id: string) {
+     return cachedMessages.has(message_id) || (await db.count("messages", message_id)) > 0;
+ }
+ 
++export async function hasCreatedEventIDB(message_id: string) {
++    await dbReady;
++    return (await db.get("messages", message_id))?.created_journaled === true;
++}
++
+ export async function countMessagesIDB() {
+     return db.count("messages");
+ }
+@@ -175,27 +183,49 @@ export async function getMessagesByChannelAndAfterTimestampIDB(channel_id: strin
+ }
+ 
+ export async function addMessageIDB(message: LoggedMessageJSON, status: DBMessageStatus) {
+-    await db.put("messages", {
++    await dbReady;
++    const existing = await db.get("messages", message.id);
++    await db.put("messages", preserveCreatedJournalMarker(existing, {
+         channel_id: message.channel_id,
+         message_id: message.id,
+         status,
+-        message,
+-    });
++        message
++    }));
+ 
+     cachedMessages.set(message.id, message);
+ }
+ 
++export async function markCreatedEventIDB(message: LoggedMessageJSON) {
++    await dbReady;
++    const existing = await db.get("messages", message.id);
++    await db.put("messages", existing == null
++        ? {
++            channel_id: message.channel_id,
++            message_id: message.id,
++            status: DBMessageStatus.CREATED,
++            message,
++            created_journaled: true
++        }
++        : { ...existing, created_journaled: true });
++
++    cachedMessages.set(message.id, existing?.message ?? message);
++}
++
+ export async function addMessagesBulkIDB(messages: LoggedMessageJSON[], status?: DBMessageStatus) {
++    await dbReady;
+     const tx = db.transaction("messages", "readwrite");
+     const { store } = tx;
+ 
+     await Promise.all([
+-        ...messages.map(message => store.add({
+-            channel_id: message.channel_id,
+-            message_id: message.id,
+-            status: status ?? getMessageStatus(message),
+-            message,
+-        })),
++        ...messages.map(async message => {
++            const existing = await store.get(message.id);
++            await store.put(preserveCreatedJournalMarker(existing, {
++                channel_id: message.channel_id,
++                message_id: message.id,
++                status: status ?? getMessageStatus(message),
++                message
++            }));
++        }),
+         tx.done
+     ]);
+ 
+diff --git a/index.tsx b/index.tsx
+index ba255d592df25895d34f5e912593e6d1ea034499..d9bfaf44307c38aa5f3ac12ec83792b3ff9c9d1a 100644
+--- a/index.tsx
++++ b/index.tsx
+@@ -4,40 +4,200 @@
+  * SPDX-License-Identifier: GPL-3.0-or-later
+  */
+ 
++// Modified 2026-07-24 by SeaL773: add opt-in lifecycle collection, validated
++// catalog scoping, and user-triggered historical backfill for the local Bridge.
++
+ export const VERSION = "4.0.0";
+ 
+ export const Native = getNative();
+ 
+ import "./styles.css";
+ 
++import { ApplicationCommandInputType, ApplicationCommandOptionType, findOption } from "@api/Commands";
++import { NavContextMenuPatchCallback } from "@api/ContextMenu";
+ import ErrorBoundary from "@components/ErrorBoundary";
+ import { Devs } from "@utils/constants";
+ import { Logger } from "@utils/Logger";
+ import definePlugin from "@utils/types";
+ import { findByPropsLazy } from "@webpack";
+-import { FluxDispatcher, MessageStore, React, UserStore } from "@webpack/common";
++import { Alerts, Constants, FluxDispatcher, Menu, MessageStore, React, RestAPI, UserStore } from "@webpack/common";
+ 
++import { runBackfillExecution } from "./backfillExecution";
++import { createBackfillLifecycle } from "./backfillLifecycle";
++import { DEFAULT_BACKFILL_COUNT, paginateBackfill, validateBackfillCount } from "./backfillPagination";
++import { fetchAndPrepareBackfill } from "./backfillPreparation";
++import { getRequestedEventNames, refreshChannelCatalog } from "./channelCatalog";
+ import { OpenLogsButton } from "./components/LogsButton";
+ import { openLogModal } from "./components/LogsModal";
+ import * as idb from "./db";
+-import { addMessage } from "./LoggedMessageManager";
+ import * as LoggedMessageManager from "./LoggedMessageManager";
++import { addMessage } from "./LoggedMessageManager";
+ import { settings } from "./settings";
+ import { FetchMessagesResponse, LoadMessagePayload, LoggedMessage, LoggedMessageJSON, MessageCreatePayload, MessageDeleteBulkPayload, MessageDeletePayload, MessageUpdatePayload } from "./types";
+-import { cleanUpCachedMessage, cleanupUserObject, getNative, isGhostPinged, mapTimestamp, messageJsonToMessageClass, reAddDeletedMessages } from "./utils";
++import { cleanUpCachedMessage, cleanupMessage, cleanupUserObject, getNative, isGhostPinged, mapTimestamp, messageJsonToMessageClass, reAddDeletedMessages } from "./utils";
+ import { removeContextMenuBindings, setupContextMenuPatches } from "./utils/contextMenu";
+ import { shouldIgnore } from "./utils/index";
+ import { LimitedMap } from "./utils/LimitedMap";
+ import { doesMatch } from "./utils/parseQuery";
+ import * as imageUtils from "./utils/saveImage";
+ import * as ImageManager from "./utils/saveImage/ImageManager";
+-import { checkForUpdatesAndNotify } from "./utils/updater";
+ export { settings };
+ 
+ export const Flogger = new Logger("MessageLoggerEnhanced", "#f26c6c");
+ 
+ export const cacheSentMessages = new LimitedMap<string, LoggedMessageJSON>();
+ 
++const backfillLifecycle = createBackfillLifecycle();
++
++function isValidHistoricalMessage(value: unknown, channelId: string): value is LoggedMessageJSON {
++    if (typeof value !== "object" || value === null)
++        return false;
++
++    const message = value as Partial<LoggedMessageJSON>;
++    return typeof message.id === "string"
++        && /^\d+$/.test(message.id)
++        && message.channel_id === channelId
++        && typeof message.timestamp === "string"
++        && message.timestamp.length > 0
++        && !Number.isNaN(Date.parse(message.timestamp));
++}
++
++function formatBackfillResult(
++    requested: number,
++    examined: number,
++    unique: number,
++    ignored: number,
++    alreadyPresent: number,
++    persisted: number,
++    historyEnded: boolean,
++    interrupted: boolean
++) {
++    return [
++        `Backfill ${interrupted ? "interrupted" : "complete"}.`,
++        `requested=${requested}`,
++        `examined=${examined}`,
++        `unique=${unique}`,
++        `ignored=${ignored}`,
++        `already-present=${alreadyPresent}`,
++        `persisted=${persisted}`,
++        `history-ended=${historyEnded ? "yes" : "no"}`
++    ].join(" ");
++}
++
++async function backfillCurrentChannel(channelId: string, requestedCount: number) {
++    if (!settings.store.persistCreatedMessages)
++        throw new Error("Enable created-message persistence before running backfill.");
++    if (getRequestedEventNames(channelId) == null)
++        throw new Error("This channel is not in the active Bridge channel-catalog allowlist.");
++
++    const lease = backfillLifecycle.begin(channelId);
++    try {
++        const result = await fetchAndPrepareBackfill(
++            settings.store.persistCreatedMessages,
++            () => paginateBackfill<LoggedMessageJSON>(requestedCount, async ({ limit, before }) => {
++                const response: unknown = await RestAPI.get({
++                    url: Constants.Endpoints.MESSAGES(channelId),
++                    query: { limit, ...(before ? { before } : {}) },
++                    retries: 2
++                });
++                if (typeof response !== "object" || response === null || !("ok" in response) || response.ok !== true)
++                    throw new Error("Discord history request failed.");
++                if (!("body" in response) || !Array.isArray(response.body))
++                    throw new Error("Discord history response body was not an array.");
++
++                const { body } = response;
++                if (!body.every(message => isValidHistoricalMessage(message, channelId)))
++                    throw new Error("Discord history response contained an invalid message.");
++                return body;
++            }, () => {
++                if (!backfillLifecycle.isCurrent(lease))
++                    throw new Error("MessageLoggerEnhanced stopped during history fetch.");
++                if (!settings.store.persistCreatedMessages)
++                    throw new Error("Created-message persistence was disabled during history fetch.");
++                if (getRequestedEventNames(channelId) == null)
++                    throw new Error("The channel left the active Bridge allowlist during history fetch.");
++            }),
++            cleanupMessage,
++            rawMessage => rawMessage.timestamp,
++            message => shouldIgnore({
++                channelId: message.channel_id,
++                guildId: message.guildId ?? message.guild_id,
++                authorId: message.author?.id,
++                bot: message.author?.bot,
++                flags: message.flags,
++                isCachedByUs: true
++            })
++        );
++
++        if (!backfillLifecycle.isCurrent(lease) || !settings.store.persistCreatedMessages || getRequestedEventNames(channelId) == null)
++            return formatBackfillResult(requestedCount, result.examined, result.unique, result.ignored, 0, 0, result.historyEnded, true);
++
++        const oldestFirst = result.entries.slice().reverse();
++        const persistence = await LoggedMessageManager.persistHistoricalCreatedMessages(
++            oldestFirst,
++            () => backfillLifecycle.isCurrent(lease) && settings.store.persistCreatedMessages && getRequestedEventNames(channelId) != null
++        );
++        return formatBackfillResult(
++            requestedCount,
++            result.examined,
++            result.unique,
++            result.ignored,
++            persistence.alreadyPresent,
++            persistence.persisted,
++            result.historyEnded,
++            persistence.interrupted
++        );
++    } finally {
++        backfillLifecycle.finish(lease);
++    }
++}
++
++const BACKFILL_COUNTS = [100, 500, 1000, 5000] as const;
++const BACKFILL_MENU_ID = "mle-backfill-history";
++
++interface ContextMenuChannel {
++    id: string;
++}
++
++function isContextMenuChannel(value: unknown): value is ContextMenuChannel {
++    if (typeof value !== "object" || value === null || !("id" in value))
++        return false;
++
++    return typeof value.id === "string" && /^\d+$/.test(value.id);
++}
++
++async function runBackfillWithLocalFeedback(channelId: string, requestedCount: unknown) {
++    const result = await runBackfillExecution(
++        channelId,
++        requestedCount,
++        validateBackfillCount,
++        backfillCurrentChannel,
++        code => Flogger.error("History backfill failed", { code })
++    );
++    Alerts.show({
++        title: result.ok ? "History Backfill Complete" : "History Backfill Failed",
++        body: result.message,
++        confirmText: "Close"
++    });
++}
++
++const patchBackfillChannelContextMenu: NavContextMenuPatchCallback = (children, { channel }: { channel?: unknown; }) => {
++    if (!isContextMenuChannel(channel)) return;
++
++    children.push(
++        <Menu.MenuItem id={BACKFILL_MENU_ID} label="Backfill History">
++            {BACKFILL_COUNTS.map(count => (
++                <Menu.MenuItem
++                    id={`${BACKFILL_MENU_ID}-${count}`}
++                    key={`${BACKFILL_MENU_ID}-${count}`}
++                    label={String(count)}
++                    action={() => void runBackfillWithLocalFeedback(channel.id, count)}
++                />
++            ))}
++        </Menu.MenuItem>
++    );
++};
++
+ const cacheThing = findByPropsLazy("commit", "getOrCreate");
+ 
+ let oldGetMessage: typeof MessageStore.getMessage;
+@@ -107,7 +267,12 @@ async function messageDeleteBulkHandler({ channelId, guildId, ids }: MessageDele
+         if (msg) messages.push(msg as LoggedMessageJSON);
+     }
+ 
+-    await idb.addMessagesBulkIDB(messages);
++    for (const message of messages) {
++        const status = isGhostPinged(message)
++            ? idb.DBMessageStatus.GHOST_PINGED
++            : idb.DBMessageStatus.DELETED;
++        await addMessage(message, status);
++    }
+ }
+ 
+ async function messageUpdateHandler(payload: MessageUpdatePayload) {
+@@ -159,7 +324,9 @@ async function messageUpdateHandler(payload: MessageUpdatePayload) {
+     await addMessage(message, idb.DBMessageStatus.EDITED);
+ }
+ 
+-function messageCreateHandler(payload: MessageCreatePayload) {
++async function messageCreateHandler(payload: MessageCreatePayload) {
++    if (payload.optimistic) return;
++
+     // we do this here because cache is limited and to save memory
+     if (!settings.store.cacheMessagesFromServers && payload.guildId != null) {
+         const ids = [payload.channelId, payload.message?.author?.id, payload.guildId];
+@@ -172,7 +339,20 @@ function messageCreateHandler(payload: MessageCreatePayload) {
+         }
+     }
+ 
+-    cacheSentMessages.set(`${payload.message.channel_id},${payload.message.id}`, cleanUpCachedMessage(payload.message));
++    const cachedMessage = cleanUpCachedMessage(payload.message);
++    cacheSentMessages.set(`${payload.message.channel_id},${payload.message.id}`, cachedMessage);
++
++    if (!settings.store.persistCreatedMessages) return;
++    if (shouldIgnore({
++        channelId: cachedMessage.channel_id,
++        guildId: payload.guildId ?? cachedMessage.guildId,
++        authorId: cachedMessage.author?.id,
++        bot: cachedMessage.author?.bot,
++        flags: cachedMessage.flags,
++        isCachedByUs: true
++    })) return;
++
++    await addMessage(cachedMessage, idb.DBMessageStatus.CREATED);
+     // Flogger.log(`cached\nkey:${payload.message.channel_id},${payload.message.id}\nvalue:`, payload.message);
+ }
+ 
+@@ -236,6 +416,7 @@ export default definePlugin({
+     authors: [Devs.Aria],
+     description: "G'day",
+     dependencies: ["MessageLogger"],
++    enabledByDefault: false,
+ 
+     patches: [
+         {
+@@ -300,6 +481,27 @@ export default definePlugin({
+     ],
+     settings,
+ 
++    contextMenus: {
++        "channel-context": patchBackfillChannelContextMenu,
++        "thread-context": patchBackfillChannelContextMenu
++    },
++
++    commands: [{
++        name: "backfillmessages",
++        description: "Collect recent history from the current allowlisted channel into the local Bridge journal",
++        inputType: ApplicationCommandInputType.BUILT_IN,
++        options: [{
++            name: "count",
++            description: "Newest history entries to examine (default 100, range 1-5000)",
++            required: false,
++            type: ApplicationCommandOptionType.INTEGER
++        }],
++        execute: async (args, ctx) => {
++            const channelId = ctx.channel.id;
++            await runBackfillWithLocalFeedback(channelId, findOption(args, "count", DEFAULT_BACKFILL_COUNT));
++        }
++    }],
++
+     toolboxActions: {
+         "Message Logger"() {
+             openLogModal();
+@@ -360,6 +562,7 @@ export default definePlugin({
+     },
+ 
+     flux: {
++        "CONNECTION_OPEN": refreshChannelCatalog,
+         "MESSAGE_DELETE": messageDeleteHandler as any,
+         "MESSAGE_DELETE_BULK": messageDeleteBulkHandler,
+         "MESSAGE_UPDATE": messageUpdateHandler,
+@@ -367,6 +570,7 @@ export default definePlugin({
+     },
+ 
+     async start() {
++        backfillLifecycle.start();
+         this.oldGetMessage = oldGetMessage = MessageStore.getMessage;
+ 
+         // we have to do this because the original message logger fetches the message from the store now
+@@ -388,9 +592,8 @@ export default definePlugin({
+             });
+         };
+ 
+-        checkForUpdatesAndNotify(settings.store.autoCheckForUpdates);
+-
+         Native.init();
++        void refreshChannelCatalog();
+ 
+         const { imageCacheDir, logsDir } = await Native.getSettings();
+         settings.store.imageCacheDir = imageCacheDir;
+@@ -400,8 +603,8 @@ export default definePlugin({
+     },
+ 
+     stop() {
++        backfillLifecycle.stop();
+         removeContextMenuBindings();
+         MessageStore.getMessage = this.oldGetMessage;
+     }
+ });
+-
+diff --git a/messagePersistenceCoordinator.ts b/messagePersistenceCoordinator.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..fd55adbc10b4761a40e581d206fa6d1c22e836d9
+--- /dev/null
++++ b/messagePersistenceCoordinator.ts
+@@ -0,0 +1,81 @@
++/*
++ * Vencord, a Discord client mod
++ * Copyright (c) 2024 Vendicated and contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++// Modified 2026-07-24 by SeaL773: coordinate all lifecycle persistence by
++// message ID and provide retryable CREATED journal commits.
++
++export type CreatedCommitOutcome = "journaled" | "already-journaled" | "interrupted";
++
++export interface CreatedCommitOperations {
++    messageId: string;
++    canAppend: () => boolean;
++    hasCreatedEvent: () => Promise<boolean>;
++    appendCreated: () => Promise<void>;
++    markCreatedEvent: () => Promise<void>;
++    storeUnmarked?: () => Promise<void>;
++    storeWhenCannotAppend?: boolean;
++}
++
++export interface MessagePersistenceCoordinator {
++    runExclusive<T>(messageId: string, operation: () => Promise<T>): Promise<T>;
++    commitCreated(operations: CreatedCommitOperations): Promise<CreatedCommitOutcome>;
++}
++
++export function preserveCreatedJournalMarker<T extends object>(
++    existing: { created_journaled?: true; } | undefined,
++    replacement: T
++): T & { created_journaled?: true; } {
++    return existing?.created_journaled === true
++        ? { ...replacement, created_journaled: true }
++        : replacement;
++}
++
++export function createMessagePersistenceCoordinator(): MessagePersistenceCoordinator {
++    const locks = new Map<string, Promise<void>>();
++
++    async function runExclusive<T>(messageId: string, operation: () => Promise<T>): Promise<T> {
++        const previous = locks.get(messageId) ?? Promise.resolve();
++        let release = () => { };
++        const current = new Promise<void>(resolve => {
++            release = resolve;
++        });
++        locks.set(messageId, current);
++
++        await previous;
++        try {
++            return await operation();
++        } finally {
++            release();
++            if (locks.get(messageId) === current)
++                locks.delete(messageId);
++        }
++    }
++
++    async function commitCreated(operations: CreatedCommitOperations): Promise<CreatedCommitOutcome> {
++        return runExclusive(operations.messageId, async () => {
++            if (await operations.hasCreatedEvent())
++                return "already-journaled";
++
++            if (!operations.canAppend()) {
++                if (operations.storeWhenCannotAppend)
++                    await operations.storeUnmarked?.();
++                return "interrupted";
++            }
++
++            try {
++                await operations.appendCreated();
++            } catch (error) {
++                await operations.storeUnmarked?.();
++                throw error;
++            }
++
++            await operations.markCreatedEvent();
++            return "journaled";
++        });
++    }
++
++    return { runExclusive, commitCreated };
++}
+diff --git a/native/index.ts b/native/index.ts
+index 7973af2dd4929b9957a9080b1157795dbdba8711..c9645b08962aad61db95981efe7dde57b69797c0 100644
+--- a/native/index.ts
++++ b/native/index.ts
+@@ -4,7 +4,11 @@
+  * SPDX-License-Identifier: GPL-3.0-or-later
+  */
+ 
+-import { readdir, readFile, unlink, writeFile } from "node:fs/promises";
++// Modified 2026-07-20 by SeaL773: add serialized NDJSON integration I/O,
++// scoped catalog validation, rotation, and idempotent journal clearing.
++
++import { randomUUID } from "node:crypto";
++import { appendFile, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+ import path from "node:path";
+ 
+ import { DATA_DIR } from "@main/utils/constants";
+@@ -13,9 +17,8 @@ import { dialog, IpcMainInvokeEvent, shell } from "electron";
+ import { getSettings, saveSettings } from "./settings";
+ export * from "./export";
+ export * from "./import";
+-export * from "./updater";
+ 
+-import { LoggedAttachment } from "../types";
++import { ChannelCatalogEntry, ChannelCatalogRequest, ChannelCatalogResult, LoggedAttachment } from "../types";
+ import { LOGS_DATA_FILENAME } from "../utils/constants";
+ import { ensureDirectoryExists, getAttachmentIdFromFilename, sleep } from "./utils";
+ 
+@@ -30,10 +33,32 @@ export const getNativeSavedImages = () => nativeSavedImages;
+ 
+ let logsDir: string;
+ let imageCacheDir: string;
++let eventLogWriteQueue = Promise.resolve();
++let lastChannelCatalogRequest: ChannelCatalogRequest | null = null;
++
++const EVENT_LOG_FILENAME = "message-events.ndjson";
++const EVENT_LOG_MAX_BYTES = 100 * 1024 * 1024;
++const CHANNEL_CATALOG_REQUEST_FILENAME = "channel-catalog.request.json";
++const CHANNEL_CATALOG_RESULT_FILENAME = "channel-catalog.result.json";
++const CHANNEL_CATALOG_REQUEST_MAX_BYTES = 16 * 1024;
++const CHANNEL_CATALOG_NAME_MAX_LENGTH = 256;
++const SNOWFLAKE_PATTERN = /^\d{17,20}$/;
++const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
++const GUILD_TEXT_CHANNEL_TYPES = new Set([0, 5, 15, 16]);
+ 
+ const getImageCacheDir = async () => imageCacheDir ?? await getDefaultNativeImageDir();
+ const getLogsDir = async () => logsDir ?? await getDefaultNativeDataDir();
+ 
++function isMissingFileError(error: unknown): error is Error & { code: string; } {
++    return error instanceof Error && "code" in error && error.code === "ENOENT";
++}
++
++function enqueueEventLogOperation(operation: () => Promise<void>) {
++    const pendingOperation = eventLogWriteQueue.then(operation, operation);
++    eventLogWriteQueue = pendingOperation.catch(() => undefined);
++    return pendingOperation;
++}
++
+ 
+ 
+ export async function initDirs() {
+@@ -99,6 +124,250 @@ export async function writeLogs(_event: IpcMainInvokeEvent, contents: string) {
+     writeFile(path.join(logsDir, LOGS_DATA_FILENAME), contents);
+ }
+ 
++export function appendLogEvent(_event: IpcMainInvokeEvent, eventJson: string) {
++    if (!eventJson) return;
++
++    const writeEvent = async () => {
++        const logsDir = await getLogsDir();
++        const eventLogPath = path.join(logsDir, EVENT_LOG_FILENAME);
++        const rotatedLogPath = `${eventLogPath}.1`;
++
++        await ensureDirectoryExists(logsDir);
++
++        try {
++            const eventLogStats = await stat(eventLogPath);
++            if (eventLogStats.size >= EVENT_LOG_MAX_BYTES) {
++                try {
++                    await unlink(rotatedLogPath);
++                } catch (error) {
++                    if (!isMissingFileError(error))
++                        throw error;
++                }
++                await rename(eventLogPath, rotatedLogPath);
++            }
++        } catch (error) {
++            if (!isMissingFileError(error))
++                throw error;
++        }
++
++        await appendFile(eventLogPath, `${eventJson}\n`, "utf-8");
++    };
++
++    return enqueueEventLogOperation(writeEvent);
++}
++
++export function clearLogEvents(_event: IpcMainInvokeEvent) {
++    const clearEvents = async () => {
++        const eventLogPath = path.join(await getLogsDir(), EVENT_LOG_FILENAME);
++
++        for (const filePath of [eventLogPath, `${eventLogPath}.1`]) {
++            try {
++                await unlink(filePath);
++            } catch (error) {
++                if (!isMissingFileError(error))
++                    throw error;
++            }
++        }
++    };
++
++    const pendingClear = eventLogWriteQueue.then(clearEvents, clearEvents);
++    eventLogWriteQueue = pendingClear.catch(() => undefined);
++    return pendingClear;
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++    return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]) {
++    const actualKeys = Object.keys(value);
++    return actualKeys.length === keys.length && actualKeys.every(key => keys.includes(key));
++}
++
++function isBoundedName(value: unknown): value is string {
++    return typeof value === "string"
++        && value.trim().length > 0
++        && value.length <= CHANNEL_CATALOG_NAME_MAX_LENGTH
++        && !/[\u0000-\u001f\u007f]/.test(value);
++}
++
++function parseChannelCatalogRequest(value: unknown): ChannelCatalogRequest {
++    if (!isRecord(value))
++        throw new Error("Invalid channel catalog request object");
++    if (value.schema_version !== 1)
++        throw new Error("Unsupported channel catalog request schema");
++    if (typeof value.request_id !== "string" || !UUID_PATTERN.test(value.request_id))
++        throw new Error("Invalid channel catalog request ID");
++    if (typeof value.guild_id !== "string" || !SNOWFLAKE_PATTERN.test(value.guild_id))
++        throw new Error("Invalid channel catalog guild ID");
++
++    if (value.mode === "selected_channels") {
++        if (!hasOnlyKeys(value, ["schema_version", "request_id", "guild_id", "mode", "channel_ids"]))
++            throw new Error("Invalid selected channel catalog request fields");
++        if (!Array.isArray(value.channel_ids) || value.channel_ids.length < 1 || value.channel_ids.length > 64)
++            throw new Error("Invalid channel catalog channel count");
++        if (!value.channel_ids.every(channelId => typeof channelId === "string" && SNOWFLAKE_PATTERN.test(channelId)))
++            throw new Error("Invalid channel catalog channel ID");
++        if (new Set(value.channel_ids).size !== value.channel_ids.length)
++            throw new Error("Duplicate channel catalog channel ID");
++
++        return {
++            schema_version: 1,
++            request_id: value.request_id,
++            guild_id: value.guild_id,
++            mode: "selected_channels",
++            channel_ids: [...value.channel_ids]
++        };
++    }
++
++    if (value.mode === "guild_text_channels") {
++        if (!hasOnlyKeys(value, ["schema_version", "request_id", "guild_id", "mode"]))
++            throw new Error("Invalid guild channel catalog request fields");
++
++        return {
++            schema_version: 1,
++            request_id: value.request_id,
++            guild_id: value.guild_id,
++            mode: "guild_text_channels"
++        };
++    }
++
++    throw new Error("Invalid channel catalog request mode");
++}
++
++function parseChannelCatalogEntry(value: unknown, requireGuildTextChannel: boolean): ChannelCatalogEntry {
++    if (!isRecord(value))
++        throw new Error("Invalid channel catalog entry");
++
++    const hasName = "name" in value;
++    const hasType = "type" in value;
++    const hasParentName = "parent_name" in value;
++    const expectedKeys = ["id", "status"];
++    if (hasName) expectedKeys.push("name");
++    if (hasType) expectedKeys.push("type");
++    if (hasParentName) expectedKeys.push("parent_name");
++    if (!hasOnlyKeys(value, expectedKeys))
++        throw new Error("Invalid channel catalog entry fields");
++    if (typeof value.id !== "string" || !SNOWFLAKE_PATTERN.test(value.id))
++        throw new Error("Invalid channel catalog entry ID");
++    if (value.status !== "ok" && value.status !== "not_found" && value.status !== "guild_mismatch")
++        throw new Error("Invalid channel catalog entry status");
++    if (hasName && !isBoundedName(value.name))
++        throw new Error("Invalid channel catalog entry name");
++    if (hasParentName && !isBoundedName(value.parent_name))
++        throw new Error("Invalid channel catalog parent name");
++    if (hasType && (!Number.isInteger(value.type) || (value.type as number) < 0 || (value.type as number) > 10000))
++        throw new Error("Invalid channel catalog entry type");
++    if (value.status !== "ok" && (hasName || hasType || hasParentName))
++        throw new Error("Non-matching channel catalog entry cannot have metadata");
++    if (value.status === "ok" && !hasType)
++        throw new Error("Matching channel catalog entry requires a type");
++    if (requireGuildTextChannel) {
++        if (value.status !== "ok" || !hasName || !hasType || !GUILD_TEXT_CHANNEL_TYPES.has(value.type as number))
++            throw new Error("Invalid guild text channel catalog entry");
++    }
++
++    return {
++        id: value.id,
++        ...(hasName ? { name: value.name as string } : {}),
++        ...(hasType ? { type: value.type as number } : {}),
++        ...(hasParentName ? { parent_name: value.parent_name as string } : {}),
++        status: value.status
++    };
++}
++
++function parseChannelCatalogResult(value: unknown, request: ChannelCatalogRequest): ChannelCatalogResult {
++    if (!isRecord(value) || !hasOnlyKeys(value, ["schema_version", "request_id", "generated_at", "guild", "channels"]))
++        throw new Error("Invalid channel catalog result object");
++    if (value.schema_version !== 1 || value.request_id !== request.request_id)
++        throw new Error("Channel catalog result does not match request");
++    if (typeof value.generated_at !== "string" || !Number.isFinite(Date.parse(value.generated_at)))
++        throw new Error("Invalid channel catalog generation time");
++    if (!isRecord(value.guild))
++        throw new Error("Invalid channel catalog guild");
++
++    const guildHasName = "name" in value.guild;
++    if (!hasOnlyKeys(value.guild, guildHasName ? ["id", "name"] : ["id"]) || value.guild.id !== request.guild_id)
++        throw new Error("Channel catalog guild does not match request");
++    if (guildHasName && !isBoundedName(value.guild.name))
++        throw new Error("Invalid channel catalog guild name");
++    if (!Array.isArray(value.channels))
++        throw new Error("Invalid channel catalog result channels");
++
++    let channels: ChannelCatalogEntry[];
++    if (request.mode === "selected_channels") {
++        if (value.channels.length !== request.channel_ids.length)
++            throw new Error("Channel catalog result channel count does not match request");
++        channels = value.channels.map(channel => parseChannelCatalogEntry(channel, false));
++        if (channels.some((channel, index) => channel.id !== request.channel_ids[index]))
++            throw new Error("Channel catalog result channel set does not match request");
++    } else {
++        if (value.channels.length > 500)
++            throw new Error("Invalid guild channel catalog result count");
++        channels = value.channels.map(channel => parseChannelCatalogEntry(channel, true));
++        if (new Set(channels.map(channel => channel.id)).size !== channels.length)
++            throw new Error("Duplicate guild channel catalog entry ID");
++    }
++
++    return {
++        schema_version: 1,
++        request_id: request.request_id,
++        generated_at: value.generated_at,
++        guild: {
++            id: request.guild_id,
++            ...(guildHasName ? { name: value.guild.name as string } : {})
++        },
++        channels
++    };
++}
++
++export async function readChannelCatalogRequest(_event: IpcMainInvokeEvent): Promise<ChannelCatalogRequest | null> {
++    const requestPath = path.join(await getLogsDir(), CHANNEL_CATALOG_REQUEST_FILENAME);
++
++    try {
++        const requestStats = await stat(requestPath);
++        if (!requestStats.isFile() || requestStats.size > CHANNEL_CATALOG_REQUEST_MAX_BYTES)
++            throw new Error("Channel catalog request is not a bounded regular file");
++
++        const contents = await readFile(requestPath, "utf-8");
++        if (Buffer.byteLength(contents, "utf-8") > CHANNEL_CATALOG_REQUEST_MAX_BYTES)
++            throw new Error("Channel catalog request exceeds maximum size");
++
++        const request = parseChannelCatalogRequest(JSON.parse(contents));
++        lastChannelCatalogRequest = request;
++        return request;
++    } catch (error) {
++        if (isMissingFileError(error))
++            return null;
++        throw error;
++    }
++}
++
++export async function writeChannelCatalogResult(_event: IpcMainInvokeEvent, result: ChannelCatalogResult | string) {
++    if (!lastChannelCatalogRequest)
++        throw new Error("No validated channel catalog request is active");
++
++    const parsedInput: unknown = typeof result === "string" ? JSON.parse(result) : result;
++    const validatedResult = parseChannelCatalogResult(parsedInput, lastChannelCatalogRequest);
++    const logsDir = await getLogsDir();
++    const resultPath = path.join(logsDir, CHANNEL_CATALOG_RESULT_FILENAME);
++    const temporaryPath = path.join(logsDir, `.${CHANNEL_CATALOG_RESULT_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
++
++    await ensureDirectoryExists(logsDir);
++    try {
++        await writeFile(temporaryPath, `${JSON.stringify(validatedResult, null, 2)}\n`, { encoding: "utf-8", flag: "wx" });
++        await rename(temporaryPath, resultPath);
++    } catch (error) {
++        try {
++            await unlink(temporaryPath);
++        } catch (cleanupError) {
++            if (!isMissingFileError(cleanupError))
++                console.error("Failed to clean up channel catalog temporary file", { code: "channel_catalog_temp_cleanup_failed" });
++        }
++        throw error;
++    }
++}
++
+ 
+ export async function getDefaultNativeImageDir(): Promise<string> {
+     return path.join(await getDefaultNativeDataDir(), "savedImages");
+diff --git a/native/updater.ts b/native/updater.ts
+deleted file mode 100644
+index 9055fc96a104bfd9ec514442f90552443af1d56c..0000000000000000000000000000000000000000
+--- a/native/updater.ts
++++ /dev/null
+@@ -1,134 +0,0 @@
+-/*
+- * Vencord, a Discord client mod
+- * Copyright (c) 2024 Vendicated and contributors
+- * SPDX-License-Identifier: GPL-3.0-or-later
+- */
+-
+-import { execFile as cpExecFile, ExecFileOptions } from "node:child_process";
+-
+-import { readdir } from "fs/promises";
+-import { join } from "path";
+-import { promisify } from "util";
+-
+-import type { GitResult } from "../types";
+-import { memoize } from "../utils/memoize";
+-
+-const execFile = promisify(cpExecFile);
+-
+-const isFlatpak = process.platform === "linux" && Boolean(process.env.FLATPAK_ID?.includes("discordapp") || process.env.FLATPAK_ID?.includes("Discord"));
+-if (process.platform === "darwin") process.env.PATH = `/usr/local/bin:${process.env.PATH}`;
+-
+-
+-const VENCORD_USER_PLUGIN_DIR = join(__dirname, "..", "src", "userplugins");
+-const getCwd = memoize(async () => {
+-    const dirs = await readdir(VENCORD_USER_PLUGIN_DIR, { withFileTypes: true });
+-
+-    for (const dir of dirs) {
+-        if (!dir.isDirectory()) continue;
+-
+-        const pluginDir = join(VENCORD_USER_PLUGIN_DIR, dir.name);
+-        const files = await readdir(pluginDir);
+-
+-        if (files.includes("LoggedMessageManager.ts")) return join(VENCORD_USER_PLUGIN_DIR, dir.name);
+-    }
+-
+-    return;
+-});
+-
+-async function git(...args: string[]): Promise<GitResult> {
+-    const opts: ExecFileOptions = { cwd: await getCwd(), shell: true };
+-
+-    try {
+-        let result;
+-        if (isFlatpak) {
+-            result = await execFile("flatpak-spawn", ["--host", "git", ...args], opts);
+-        } else {
+-            result = await execFile("git", args, opts);
+-        }
+-
+-        return { value: result.stdout.trim(), stderr: result.stderr, ok: true };
+-    } catch (error: any) {
+-        return {
+-            ok: false,
+-            cmd: error.cmd as string,
+-            message: error.stderr as string,
+-            error
+-        };
+-    }
+-}
+-
+-export async function update() {
+-    return await git("pull");
+-}
+-
+-export async function getCommitHash() {
+-    return await git("rev-parse", "HEAD");
+-}
+-
+-export interface GitInfo {
+-    repo: string;
+-    gitHash: string;
+-}
+-
+-export async function getRepoInfo(): Promise<GitResult> {
+-    const res = await git("remote", "get-url", "origin");
+-    if (!res.ok) {
+-        return res;
+-    }
+-
+-    const gitHash = await getCommitHash();
+-    if (!gitHash.ok) {
+-        return gitHash;
+-    }
+-
+-    return {
+-        ok: true,
+-        value: {
+-            repo: res.value
+-                .replace(/git@(.+):/, "https://$1/")
+-                .replace(/\.git$/, ""),
+-            gitHash: gitHash.value
+-        }
+-    };
+-}
+-
+-export interface Commit {
+-    hash: string;
+-    longHash: string;
+-    message: string;
+-    author: string;
+-}
+-
+-export async function getNewCommits(): Promise<GitResult> {
+-    const branch = await git("branch", "--show-current");
+-    if (!branch.ok) {
+-        return branch;
+-    }
+-
+-    const logFormat = "%H;%an;%s";
+-    const branchRange = `HEAD..origin/${branch.value}`;
+-
+-    try {
+-        await git("fetch");
+-
+-        const logOutput = await git("log", `--format="${logFormat}"`, branchRange);
+-
+-        if (!logOutput.ok) {
+-            return logOutput;
+-        }
+-
+-        if (logOutput.value.trim() === "") {
+-            return { ok: true, value: [] };
+-        }
+-
+-        const commitLines = logOutput.value.trim().split("\n");
+-        const commits: Commit[] = commitLines.map(line => {
+-            const [hash, author, ...rest] = line.split(";");
+-            return { longHash: hash, hash: hash.slice(0, 7), author, message: rest.join(";") } satisfies Commit;
+-        });
+-
+-        return { ok: true, value: commits };
+-    } catch (error: any) {
+-        return { ok: false, cmd: error.cmd, message: error.message, error };
+-    }
+-}
+diff --git a/settings.tsx b/settings.tsx
+index 84b679de2a856fe01be0c5d179915049f88b4da1..f7db2a372a80b573a68f39e59fd3e69d9fc49d1c 100644
+--- a/settings.tsx
++++ b/settings.tsx
+@@ -4,6 +4,9 @@
+  * SPDX-License-Identifier: GPL-3.0-or-later
+  */
+ 
++// Modified 2026-07-20 by SeaL773: restore privacy-safe collector defaults
++// and make full local-log clearing include the integration journal.
++
+ import { definePluginSettings, Settings } from "@api/Settings";
+ import { Button } from "@components/Button";
+ import ErrorBoundary from "@components/ErrorBoundary";
+@@ -13,8 +16,8 @@ import { Alerts, useState } from "@webpack/common";
+ import { Native } from ".";
+ import { openLogModal } from "./components/LogsModal";
+ import { ImageCacheDir, LogsDir } from "./components/settings/FolderSelectInput";
+-import { openUpdaterModal } from "./components/UpdaterModal";
+ import { clearMessagesIDB } from "./db";
++import { clearAllLocalLogs } from "./utils/clearAllLocalLogs";
+ import { DEFAULT_IMAGE_CACHE_DIR } from "./utils/constants";
+ import { exportLogs, importLogs } from "./utils/settingsUtils";
+ 
+@@ -59,20 +62,18 @@ function ExportLogsButton() {
+ }
+ 
+ export const settings = definePluginSettings({
+-    checkForUpdate: {
+-        type: OptionType.COMPONENT,
+-        description: "Check for update",
+-        component: () =>
+-            <Button onClick={() => openUpdaterModal()}>
+-                Check For Updates
+-            </Button>
+-    },
+     saveMessages: {
+         default: true,
+         type: OptionType.BOOLEAN,
+         description: "Wether to save the deleted and edited messages.",
+     },
+ 
++    persistCreatedMessages: {
++        default: false,
++        type: OptionType.BOOLEAN,
++        description: "Persist newly received messages for local integrations.",
++    },
++
+     saveImages: {
+         type: OptionType.BOOLEAN,
+         description: "Save deleted attachments.",
+@@ -91,12 +92,6 @@ export const settings = definePluginSettings({
+         description: "Usually message logger only logs from whitelisted ids and dms, enabling this would mean it would log messages from all servers as well. Note that this may cause the cache to exceed its limit, resulting in some messages being missed. If you are in a lot of servers, this may significantly increase the chances of messages being logged, which can result in a large message record and the inclusion of irrelevant messages.",
+     },
+ 
+-    autoCheckForUpdates: {
+-        default: true,
+-        type: OptionType.BOOLEAN,
+-        description: "Automatically check for updates on startup.",
+-    },
+-
+     ignoreBots: {
+         type: OptionType.BOOLEAN,
+         description: "Whether to ignore messages by bots",
+@@ -178,7 +173,7 @@ export const settings = definePluginSettings({
+     },
+ 
+     messageLimit: {
+-        default: 200,
++        default: 50000,
+         type: OptionType.NUMBER,
+         description: "Maximum number of messages to save. Older messages are deleted when the limit is reached. 0 means there is no limit"
+     },
+@@ -215,31 +210,26 @@ export const settings = definePluginSettings({
+ 
+     imageCacheDir: {
+         type: OptionType.COMPONENT,
+-        description: "Select saved images directory",
+-        component: ErrorBoundary.wrap(ImageCacheDir) as any
++        component: ErrorBoundary.wrap(ImageCacheDir)
+     },
+ 
+     logsDir: {
+         type: OptionType.COMPONENT,
+-        description: "Select logs directory",
+-        component: ErrorBoundary.wrap(LogsDir) as any
++        component: ErrorBoundary.wrap(LogsDir)
+     },
+ 
+     importLogs: {
+         type: OptionType.COMPONENT,
+-        description: "Import Logs From File",
+         component: ImportLogsButton
+     },
+ 
+     exportLogs: {
+         type: OptionType.COMPONENT,
+-        description: "Export Logs From IndexedDB",
+         component: ExportLogsButton
+     },
+ 
+     openLogs: {
+         type: OptionType.COMPONENT,
+-        description: "Open Logs",
+         component: () =>
+             <Button onClick={() => openLogModal()}>
+                 Open Logs
+@@ -247,7 +237,6 @@ export const settings = definePluginSettings({
+     },
+     openImageCacheFolder: {
+         type: OptionType.COMPONENT,
+-        description: "Opens the image cache directory",
+         component: () =>
+             <Button
+                 disabled={
+@@ -263,23 +252,20 @@ export const settings = definePluginSettings({
+ 
+     clearLogs: {
+         type: OptionType.COMPONENT,
+-        description: "Clear Logs",
+         component: () =>
+             <Button
+                 variant="dangerPrimary"
+                 onClick={() => Alerts.show({
+-                    title: "Clear Logs",
+-                    body: "Are you sure you want to clear all logs?",
+-                    // @ts-ignore
+-                    confirmVariant: "critical-primary",
+-                    confirmText: "Clear",
++                    title: "Clear All Local Logs",
++                    body: "This clears MessageLoggerEnhanced IndexedDB records and both local NDJSON integration journal files. If the Bridge is running, restart the Bridge afterward to clear its in-memory replay buffer. This does not erase downstream state, Telegram messages, backups, or other copies.",
++                    confirmText: "Clear All Local Logs",
+                     cancelText: "Cancel",
+-                    onConfirm: () => {
+-                        clearMessagesIDB();
++                    onConfirm: async () => {
++                        await clearAllLocalLogs(clearMessagesIDB, () => Native.clearLogEvents());
+                     },
+                 })}
+             >
+-                Clear Logs
++                Clear All Local Logs
+             </Button>
+     },
+ 
+diff --git a/types.ts b/types.ts
+index d7307080b97ee9992caf60aace97c6bd0c93eda6..1f3337aa3deac111bf6cee6068501593d974c975 100644
+--- a/types.ts
++++ b/types.ts
+@@ -1,23 +1,52 @@
+ /*
+- * Vencord, a modification for Discord's desktop app
++ * Vencord, a Discord client mod
+  * Copyright (c) 2023 Vendicated and contributors
+- *
+- * This program is free software: you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation, either version 3 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-*/
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++// Modified 2026-07-20 by SeaL773: define the validated Bridge channel
++// catalog request/result protocol used to scope integration collection.
+ 
+ import { Message, MessageAttachment, MessageJSON } from "@vencord/discord-types";
+ 
++interface ChannelCatalogRequestBase {
++    schema_version: 1;
++    request_id: string;
++    guild_id: string;
++}
++
++export interface SelectedChannelsCatalogRequest extends ChannelCatalogRequestBase {
++    mode: "selected_channels";
++    channel_ids: string[];
++}
++
++export interface GuildTextChannelsCatalogRequest extends ChannelCatalogRequestBase {
++    mode: "guild_text_channels";
++}
++
++export type ChannelCatalogRequest = SelectedChannelsCatalogRequest | GuildTextChannelsCatalogRequest;
++
++export type ChannelCatalogEntryStatus = "ok" | "not_found" | "guild_mismatch";
++
++export interface ChannelCatalogEntry {
++    id: string;
++    name?: string;
++    type?: number;
++    parent_name?: string;
++    status: ChannelCatalogEntryStatus;
++}
++
++export interface ChannelCatalogResult {
++    schema_version: 1;
++    request_id: string;
++    generated_at: string;
++    guild: {
++        id: string;
++        name?: string;
++    };
++    channels: ChannelCatalogEntry[];
++}
++
+ export interface LoggedAttachment extends MessageAttachment {
+     fileExtension?: string | null;
+     path?: string | null;
+diff --git a/utils/cleanUp.ts b/utils/cleanUp.ts
+index 4e44c3c3119355dec1638260109b3cc6e3bf8a05..83d67c802c7be51d58494738e1fa53bd9650083c 100644
+--- a/utils/cleanUp.ts
++++ b/utils/cleanUp.ts
+@@ -56,54 +56,131 @@ export function cleanUpCachedMessage(message: any) {
+ }
+ 
+ // stolen from mlv2
+-export function cleanupEmbed(embed) {
++export function cleanupEmbed(embed: unknown) {
+     /* backported code from MLV2 rewrite */
+-    if (!embed.id) return embed; /* already cleaned */
++    if (!isRecord(embed)) return embed;
++
+     const retEmbed: any = {};
+-    if (typeof embed.rawTitle === "string") retEmbed.title = embed.rawTitle;
+-    if (typeof embed.rawDescription === "string") retEmbed.description = embed.rawDescription;
+-    if (typeof embed.referenceId !== "undefined") retEmbed.reference_id = embed.referenceId;
+-    // if (typeof embed.color === "string") retEmbed.color = ZeresPluginLibrary.ColorConverter.hex2int(embed.color);
+-    if (typeof embed.type !== "undefined") retEmbed.type = embed.type;
+-    if (typeof embed.url !== "undefined") retEmbed.url = embed.url;
+-    if (typeof embed.provider === "object") retEmbed.provider = { name: embed.provider.name, url: embed.provider.url };
+-    if (typeof embed.footer === "object") retEmbed.footer = { text: embed.footer.text, icon_url: embed.footer.iconURL, proxy_icon_url: embed.footer.iconProxyURL };
+-    if (typeof embed.author === "object") retEmbed.author = { name: embed.author.name, url: embed.author.url, icon_url: embed.author.iconURL, proxy_icon_url: embed.author.iconProxyURL };
+-    if (typeof embed.timestamp === "object" && embed.timestamp._isAMomentObject) retEmbed.timestamp = embed.timestamp.milliseconds();
+-    if (typeof embed.thumbnail === "object") {
+-        if (typeof embed.thumbnail.proxyURL === "string" || (typeof embed.thumbnail.url === "string" && !embed.thumbnail.url.endsWith("?format=jpeg"))) {
+-            retEmbed.thumbnail = {
+-                url: embed.thumbnail.url,
+-                proxy_url: typeof embed.thumbnail.proxyURL === "string" ? embed.thumbnail.proxyURL.split("?format")[0] : undefined,
+-                width: embed.thumbnail.width,
+-                height: embed.thumbnail.height
+-            };
++    setString(retEmbed, "title", embed.rawTitle, embed.title);
++    setString(retEmbed, "description", embed.rawDescription, embed.description);
++    setString(retEmbed, "reference_id", embed.referenceId, embed.reference_id);
++    setNumber(retEmbed, "color", embed.color);
++    setString(retEmbed, "type", embed.type);
++    setString(retEmbed, "url", embed.url);
++
++    const provider = normalizeTextObject(embed.provider, {
++        name: ["name"],
++        url: ["url"]
++    });
++    if (provider) retEmbed.provider = provider;
++
++    const footer = normalizeTextObject(embed.footer, {
++        text: ["text"],
++        icon_url: ["iconURL", "icon_url"],
++        proxy_icon_url: ["iconProxyURL", "proxy_icon_url"]
++    });
++    if (footer) retEmbed.footer = footer;
++
++    const author = normalizeTextObject(embed.author, {
++        name: ["name"],
++        url: ["url"],
++        icon_url: ["iconURL", "icon_url"],
++        proxy_icon_url: ["iconProxyURL", "proxy_icon_url"]
++    });
++    if (author) retEmbed.author = author;
++
++    const timestamp = normalizeTimestamp(embed.timestamp);
++    if (timestamp !== undefined) retEmbed.timestamp = timestamp;
++
++    const thumbnail = normalizeMedia(embed.thumbnail, true);
++    if (thumbnail) retEmbed.thumbnail = thumbnail;
++
++    const image = normalizeMedia(embed.image);
++    if (image) retEmbed.image = image;
++
++    if (Array.isArray(embed.images)) {
++        const images: Record<string, unknown>[] = [];
++        for (const rawImage of embed.images) {
++            const normalizedImage = normalizeMedia(rawImage);
++            if (normalizedImage) images.push(normalizedImage);
+         }
++        if (images.length) retEmbed.images = images;
+     }
+-    if (typeof embed.image === "object") {
+-        retEmbed.image = {
+-            url: embed.image.url,
+-            proxy_url: embed.image.proxyURL,
+-            width: embed.image.width,
+-            height: embed.image.height
+-        };
+-    }
+-    if (typeof embed.video === "object") {
+-        retEmbed.video = {
+-            url: embed.video.url,
+-            proxy_url: embed.video.proxyURL,
+-            width: embed.video.width,
+-            height: embed.video.height
+-        };
+-    }
++
++    const video = normalizeMedia(embed.video);
++    if (video) retEmbed.video = video;
++
+     if (Array.isArray(embed.fields) && embed.fields.length) {
+-        retEmbed.fields = embed.fields.map(e => ({ name: e.rawName, value: e.rawValue, inline: e.inline }));
++        retEmbed.fields = embed.fields.map(field => {
++            if (!isRecord(field)) return {};
++
++            const normalizedField: Record<string, unknown> = {};
++            setString(normalizedField, "name", field.rawName, field.name);
++            setString(normalizedField, "value", field.rawValue, field.value);
++            if (typeof field.inline === "boolean") normalizedField.inline = field.inline;
++            return normalizedField;
++        });
+     }
++
+     return retEmbed;
+ }
+ 
++function isRecord(value: unknown): value is Record<string, unknown> {
++    return typeof value === "object" && value !== null;
++}
++
++function firstString(...values: unknown[]) {
++    return values.find((value): value is string => typeof value === "string");
++}
++
++function setString(target: Record<string, unknown>, key: string, ...values: unknown[]) {
++    const value = firstString(...values);
++    if (value !== undefined) target[key] = value;
++}
++
++function setNumber(target: Record<string, unknown>, key: string, value: unknown) {
++    if (typeof value === "number") target[key] = value;
++}
++
++function normalizeTextObject(value: unknown, fields: Record<string, string[]>) {
++    if (!isRecord(value)) return;
++
++    const normalized: Record<string, unknown> = {};
++    for (const [outputKey, inputKeys] of Object.entries(fields)) {
++        setString(normalized, outputKey, ...inputKeys.map(inputKey => value[inputKey]));
++    }
++    return Object.keys(normalized).length ? normalized : undefined;
++}
++
++function normalizeTimestamp(value: unknown) {
++    if (typeof value === "string") return value;
++    if (value instanceof Date) return Number.isNaN(value.getTime()) ? undefined : value.toISOString();
++    if (!isRecord(value) || typeof value.toISOString !== "function") return;
++
++    const timestamp = value.toISOString();
++    return typeof timestamp === "string" ? timestamp : undefined;
++}
++
++function normalizeMedia(value: unknown, stripProxyFormat: boolean = false) {
++    if (!isRecord(value)) return;
++
++    const url = firstString(value.url);
++    const classProxyUrl = firstString(value.proxyURL);
++    const proxyUrl = classProxyUrl ?? firstString(value.proxy_url);
++
++    const normalized: Record<string, unknown> = {};
++    if (url !== undefined) normalized.url = url;
++    if (proxyUrl !== undefined) normalized.proxy_url = stripProxyFormat && classProxyUrl !== undefined ? proxyUrl.split("?format")[0] : proxyUrl;
++    setNumber(normalized, "width", value.width);
++    setNumber(normalized, "height", value.height);
++    setString(normalized, "content_type", value.contentType, value.content_type);
++    setString(normalized, "description", value.description);
++    return Object.keys(normalized).length ? normalized : undefined;
++}
++
+ // stolen from mlv2
+ export function cleanupUserObject(user: User) {
++    const rawUser = user as User & { public_flags?: number; };
+     /* backported from MLV2 rewrite */
+     return {
+         discriminator: user.discriminator,
+@@ -111,6 +188,6 @@ export function cleanupUserObject(user: User) {
+         avatar: user.avatar,
+         id: user.id,
+         bot: user.bot,
+-        public_flags: typeof user.publicFlags !== "undefined" ? user.publicFlags : (user as any).public_flags
++        public_flags: typeof user.publicFlags !== "undefined" ? user.publicFlags : rawUser.public_flags
+     };
+ }
+diff --git a/utils/clearAllLocalLogs.ts b/utils/clearAllLocalLogs.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..cb48ada64783f626279f506b3eff63fa3759b305
+--- /dev/null
++++ b/utils/clearAllLocalLogs.ts
+@@ -0,0 +1,26 @@
++/*
++ * Vencord, a Discord client mod
++ * Copyright (c) 2024 Vendicated and contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++// Modified 2026-07-20 by SeaL773: provide failure-independent clearing of
++// IndexedDB logs and Bridge integration journals for both Clear All UIs.
++
++export type ClearLocalLogsOperation = () => Promise<void>;
++
++export async function clearAllLocalLogs(
++    clearIndexedDB: ClearLocalLogsOperation,
++    clearIntegrationLogs: ClearLocalLogsOperation
++) {
++    const results = await Promise.allSettled([
++        Promise.resolve().then(clearIndexedDB),
++        Promise.resolve().then(clearIntegrationLogs)
++    ]);
++    const errors = results
++        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
++        .map(result => result.reason as unknown);
++
++    if (errors.length > 0)
++        throw new AggregateError(errors, "Failed to clear all local logs");
++}
+diff --git a/utils/idb/async-iterators.ts b/utils/idb/async-iterators.ts
+index 97709e373962ac932f4b9cc4ee4f53e983dc96b3..04bb37ea9fb462e765fbcf1ba37e83289751ba37 100644
+--- a/utils/idb/async-iterators.ts
++++ b/utils/idb/async-iterators.ts
+@@ -20,9 +20,15 @@ const cursorIteratorTraps: ProxyHandler<any> = {
+         this: IDBPCursor,
+         ...args: any
+       ) {
++        const originalCursor = ittrProxiedCursorToOriginalProxy.get(this);
++        if (!originalCursor) throw new Error("Missing original cursor");
++
++        const method = Reflect.get(originalCursor, prop);
++        if (typeof method !== "function") throw new Error(`Missing cursor method: ${String(prop)}`);
++
+         advanceResults.set(
+           this,
+-          (ittrProxiedCursorToOriginalProxy.get(this) as any)[prop](...args),
++          Reflect.apply(method, originalCursor, args),
+         );
+       };
+     }
+diff --git a/utils/idb/database-extras.ts b/utils/idb/database-extras.ts
+index 26e6a7e8e4dac80b3502c1d86824dacfdfe3ed01..2a31b63136b0f9ed0cffcc57ea43b42cc312fc25 100644
+--- a/utils/idb/database-extras.ts
++++ b/utils/idb/database-extras.ts
+@@ -49,6 +49,11 @@ function getMethod(
+       tx.store;
+     if (useIndex) target = target.index(args.shift());
+ 
++    const operation = Reflect.get(target, targetFuncName);
++    if (typeof operation !== "function") {
++      throw new Error(`Missing IndexedDB method: ${targetFuncName}`);
++    }
++
+     // Must reject if op rejects.
+     // If it's a write operation, must reject if tx.done rejects.
+     // Must reject with op rejection first.
+@@ -56,7 +61,7 @@ function getMethod(
+     // Must handle both promises (no unhandled rejections)
+     return (
+       await Promise.all([
+-        (target as any)[targetFuncName](...args),
++        Reflect.apply(operation, target, args),
+         isWrite && tx.done,
+       ])
+     )[0];
+diff --git a/utils/idb/wrap-idb-value.ts b/utils/idb/wrap-idb-value.ts
+index 748b0ae529576594f01b41257d47ad51bf4f9b77..a0e0d658c914d2221a00c79d04058fc43bcc7eaa 100644
+--- a/utils/idb/wrap-idb-value.ts
++++ b/utils/idb/wrap-idb-value.ts
+@@ -53,7 +53,7 @@ function promisifyRequest<T>(request: IDBRequest<T>): Promise<T> {
+       request.removeEventListener("error", error);
+     };
+     const success = () => {
+-      resolve(wrap(request.result as any) as any);
++      resolve(wrap(request.result));
+       unlisten();
+     };
+     const error = () => {
+@@ -185,6 +185,7 @@ export function wrap(
+   value: IDBOpenDBRequest,
+ ): Promise<IDBPDatabase | undefined>;
+ export function wrap<T>(value: IDBRequest<T>): Promise<T>;
++export function wrap<T>(value: T): T;
+ export function wrap(value: any): any {
+   // We sometimes generate multiple promises from a single IDBRequest (eg when cursoring), because
+   // IDB is weird and a single IDBRequest can yield many responses, so these can't be cached.
+diff --git a/utils/misc.ts b/utils/misc.ts
+index 570b24c1ce67043bbcc9ea3d09a48e4e1a648fb0..1d4d07dc55ff6833a4d049115825f58a2e1f3423 100644
+--- a/utils/misc.ts
++++ b/utils/misc.ts
+@@ -50,8 +50,7 @@ export const getMessageStatus = (message: LoggedMessageJSON) => {
+     if (isGhostPinged(message)) return DBMessageStatus.GHOST_PINGED;
+     if (message.deleted) return DBMessageStatus.DELETED;
+     if (message.editHistory?.length) return DBMessageStatus.EDITED;
+-
+-    throw new Error("Unknown message status");
++    return DBMessageStatus.CREATED;
+ };
+ 
+ export const discordIdToDate = (id: string) => new Date((parseInt(id) / 4194304) + DISCORD_EPOCH);
+@@ -158,16 +157,16 @@ export function getNative(): PluginNative<typeof import("../native")> {
+             messageLoggerEnhancedUniqueIdThingyIdkMan: async () => { },
+             showItemInFolder: async () => { },
+             writeImageNative: async () => { },
+-            getCommitHash: async () => ({ ok: true, value: "" }),
+-            getRepoInfo: async () => ({ ok: true, value: { repo: "", gitHash: "" } }),
+-            getNewCommits: async () => ({ ok: true, value: [] }),
+-            update: async () => ({ ok: true, value: "" }),
+             chooseFile: async () => "",
+             downloadAttachment: async () => ({ error: "web", path: null }),
+-            startNativeLogExport: async () => "" as any,
++            startNativeLogExport: async () => crypto.randomUUID(),
+             finishNativeLogExport: async () => { },
+             writeNativeLogChunk: async () => { },
+-            startNativeLogImport: async () => "" as any,
++            appendLogEvent: async () => { },
++            clearLogEvents: async () => { },
++            readChannelCatalogRequest: async () => null,
++            writeChannelCatalogResult: async () => { },
++            startNativeLogImport: async () => crypto.randomUUID(),
+             readNativeLogChunk: async () => null,
+             closeNativeLogImport: async () => { }
+         } satisfies PluginNative<typeof import("../native")>;
+diff --git a/utils/native-file-system-adapter/types/src/adapters/sandbox.d.ts b/utils/native-file-system-adapter/types/src/adapters/sandbox.d.ts
+deleted file mode 100644
+index ed6c6ed675b288b331396d6ba1e660551b238496..0000000000000000000000000000000000000000
+--- a/utils/native-file-system-adapter/types/src/adapters/sandbox.d.ts
++++ /dev/null
+@@ -1,44 +0,0 @@
+-/* eslint-disable */
+-export class FileHandle {
+-    constructor(file: FileEntry, writable?: boolean);
+-    file: FileEntry;
+-    kind: string;
+-    writable: boolean;
+-    readable: boolean;
+-    get name(): string;
+-    isSameEntry(other: {
+-        file: {
+-            toURL: () => string;
+-        };
+-    }): boolean;
+-    getFile(): Promise<File>;
+-    createWritable(opts: any): Promise<Sink>;
+-}
+-export class FolderHandle {
+-    constructor(dir: DirectoryEntry, writable?: boolean);
+-    dir: FileSystemDirectoryEntry;
+-    writable: boolean;
+-    readable: boolean;
+-    kind: string;
+-    name: string;
+-    isSameEntry(other: FolderHandle): boolean;
+-    entries(): AsyncGenerator<[string, FileHandle | FolderHandle]>;
+-    getDirectoryHandle(name: string, opts: {
+-        create: boolean;
+-    }): Promise<FolderHandle>;
+-    getFileHandle(name: string, opts: {
+-        create: boolean;
+-    }): Promise<FileHandle>;
+-    removeEntry(name: string, opts: {
+-        recursive: boolean;
+-    }): Promise<any>;
+-}
+-declare function _default(opts?: {}): Promise<any>;
+-export default _default;
+-declare class Sink {
+-    constructor(writer: FileWriter, fileEntry: FileEntry);
+-    writer: FileWriter;
+-    fileEntry: FileEntry;
+-    write(chunk: BlobPart | any): Promise<any>;
+-    close(): Promise<any>;
+-}
+diff --git a/utils/parseQuery.ts b/utils/parseQuery.ts
+index bdfff46aede1c106ebea608544b383cd1a605a33..6a78d87072a2aac8e4977df433f6590797079e3d 100644
+--- a/utils/parseQuery.ts
++++ b/utils/parseQuery.ts
+@@ -87,7 +87,7 @@ export const doesMatch = (type: typeof validIdSearchTypes[number], value: string
+         case "user":
+             return message.author.id === value
+                 || message.author?.username?.toLowerCase().includes(value.toLowerCase())
+-                || (message.author as any)?.globalName?.toLowerCase()?.includes(value.toLowerCase());
++                || message.author?.globalName?.toLowerCase()?.includes(value.toLowerCase());
+         case "guild":
+         case "server": {
+             const guildId = message.guildId ?? getGuildIdByChannel(message.channel_id);
+diff --git a/utils/saveImage/ImageManager.ts b/utils/saveImage/ImageManager.ts
+index 97ecf273b7fd9cd790a92db20f3dea3601ffe98a..a271e51e707484e5b4fbdb3c43b5b40502167746 100644
+--- a/utils/saveImage/ImageManager.ts
++++ b/utils/saveImage/ImageManager.ts
+@@ -24,9 +24,9 @@ import {
+     set,
+ } from "@api/DataStore";
+ import { sleep } from "@utils/misc";
+-import { LoggedAttachment } from "userplugins/vc-message-logger-enhanced/types";
+ 
+ import { Flogger, Native } from "../..";
++import { LoggedAttachment } from "../../types";
+ import { DEFAULT_IMAGE_CACHE_DIR } from "../constants";
+ 
+ const ImageStore = createStore("MessageLoggerImageData", "MessageLoggerImageStore");
+diff --git a/utils/streamparser-json/tokenizer.ts b/utils/streamparser-json/tokenizer.ts
+index 3efd6c304395c7c6365c0a7c50f971651f170ec7..a26429ed3d2c71a090b6cbdf58227a10fa22a8c4 100644
+--- a/utils/streamparser-json/tokenizer.ts
++++ b/utils/streamparser-json/tokenizer.ts
+@@ -170,7 +170,6 @@ export default class Tokenizer {
+       for (let i = 0; i < buffer.length; i += 1) {
+         const n = buffer[i]; // get current byte from buffer
+         switch (this.state) {
+-          // @ts-expect-error fall through case
+           case TokenizerStates.BOM_OR_START:
+             if (input instanceof Uint8Array && n === 0xef) {
+               this.bom = [0xef, 0xbb, 0xbf];
+@@ -208,7 +207,7 @@ export default class Tokenizer {
+                 continue;
+               }
+             }
+-          // eslint-disable-next-line no-fallthrough
++            // Continue parsing from the initial tokenizer state.
+           case TokenizerStates.START:
+             this.offset += 1;
+ 
+@@ -401,7 +400,7 @@ export default class Tokenizer {
+             this.state = TokenizerStates.STRING_DEFAULT;
+             continue;
+           case TokenizerStates.STRING_AFTER_BACKSLASH:
+-            // eslint-disable-next-line no-case-declarations
++
+             const controlChar = escapedSequences[n];
+             if (controlChar) {
+               this.bufferedString.appendChar(controlChar);
+@@ -561,14 +560,13 @@ export default class Tokenizer {
+             this.state = TokenizerStates.START;
+             this.emitNumber();
+             continue;
+-          // @ts-expect-error fall through case
+           case TokenizerStates.NUMBER_AFTER_E:
+             if (n === charset.PLUS_SIGN || n === charset.HYPHEN_MINUS) {
+               this.bufferedNumber.appendChar(n);
+               this.state = TokenizerStates.NUMBER_AFTER_E_AND_SIGN;
+               continue;
+             }
+-          // eslint-disable-next-line no-fallthrough
++            // A missing sign is handled by the digit state below.
+           case TokenizerStates.NUMBER_AFTER_E_AND_SIGN:
+             if (n >= charset.DIGIT_ZERO && n <= charset.DIGIT_NINE) {
+               this.bufferedNumber.appendChar(n);
+@@ -833,7 +831,6 @@ export default class Tokenizer {
+     }
+   }
+ 
+-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+   public onToken(parsedToken: ParsedTokenInfo): void {
+     // Override me
+     throw new TokenizerError(
+diff --git a/utils/streamparser-json/tokenparser.ts b/utils/streamparser-json/tokenparser.ts
+index 4d1c43721851b0faf00b8823cbf4ee420ca7c423..2bf94981c6ba83ab531351e7593ee658e41b34da 100644
+--- a/utils/streamparser-json/tokenparser.ts
++++ b/utils/streamparser-json/tokenparser.ts
+@@ -143,8 +143,11 @@ export default class TokenParser {
+       this.value &&
+       this.stack.every((item) => !item.emit)
+     ) {
+-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+-      delete (this.value as JsonStruct as any)[this.key as string | number];
++      if (Array.isArray(this.value) && typeof this.key === "number") {
++        delete this.value[this.key];
++      } else if (!Array.isArray(this.value) && typeof this.key === "string") {
++        delete this.value[this.key];
++      }
+     }
+ 
+     if (emit) {
+@@ -382,7 +385,6 @@ export default class TokenParser {
+     }
+   }
+ 
+-  /* eslint-disable-next-line @typescript-eslint/no-unused-vars */
+   public onValue(parsedElementInfo: ParsedElementInfo): void {
+     // Override me
+     throw new TokenParserError(
+diff --git a/utils/updater.tsx b/utils/updater.tsx
+deleted file mode 100644
+index cbb92c7184687ad9a900d71378564cb4e0f1a096..0000000000000000000000000000000000000000
+--- a/utils/updater.tsx
++++ /dev/null
+@@ -1,112 +0,0 @@
+-/*
+- * Vencord, a modification for Discord's desktop app
+- * Copyright (c) 2023 Vendicated and contributors
+- *
+- * This program is free software: you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation, either version 3 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-*/
+-
+-import { showNotification } from "@api/Notifications";
+-import { relaunch } from "@utils/native";
+-import { Alerts } from "@webpack/common";
+-
+-import { Native } from "..";
+-import { UpdateErrorCard } from "../components/UpdaterModal";
+-import { Commit, GitInfo } from "../native";
+-import { GitError, GitResult } from "../types";
+-import { getNative } from "./misc";
+-
+-export let changes: Commit[] | undefined = [];
+-export let updateError: GitError | undefined;
+-export let isOutdated = false;
+-export let repoInfo: GitInfo | undefined;
+-export let isNewer = false;
+-(async () => {
+-    const Native = getNative();
+-    repoInfo = await Unwrap<GitInfo>(Native.getRepoInfo());
+-})();
+-
+-async function Unwrap<T>(p: Promise<GitResult>) {
+-    const res = await p;
+-
+-    if (res.ok) return res.value as T;
+-
+-    updateError = res;
+-    if (res.error) console.error(res.error);
+-}
+-
+-export async function getRepoInfo() {
+-    return repoInfo ?? (repoInfo = await Unwrap<GitInfo>(Native.getRepoInfo()));
+-}
+-
+-export async function checkForUpdates() {
+-    changes = await Unwrap<Commit[]>(Native.getNewCommits());
+-
+-    if (!changes)
+-        return isOutdated = false;
+-
+-    if (changes.some(c => c.hash === repoInfo?.gitHash)) {
+-        isNewer = true;
+-        return isOutdated = false;
+-    }
+-
+-    return isOutdated = changes.length > 0;
+-}
+-
+-
+-export async function update() {
+-    const res = await Native.update();
+-    if (!res.ok) {
+-        return Alerts.show({
+-            title: "Welp!",
+-            body: (<UpdateErrorCard updateError={res} title="Failed to update" />),
+-        });
+-    }
+-
+-
+-    if (!(await VencordNative.updater.rebuild()).ok) {
+-        return Alerts.show({
+-            title: "Welp!",
+-            body: "The Build failed. Please try manually building the new update",
+-        });
+-    }
+-
+-    Alerts.show({
+-        title: "Update Success!",
+-        body: "Successfully updated. Restart now to apply the changes?",
+-        confirmText: "Restart",
+-        cancelText: "Not now!",
+-        onConfirm() {
+-            relaunch();
+-        },
+-    });
+-
+-    changes = [];
+-    isOutdated = false;
+-}
+-
+-
+-export async function checkForUpdatesAndNotify(shouldNotify = false) {
+-    if (IS_WEB)
+-        return;
+-
+-    const isOutdated = await checkForUpdates();
+-    if (!isOutdated) return;
+-
+-    if (shouldNotify)
+-        setTimeout(() => showNotification({
+-            title: "Message Logger Enhanced",
+-            body: "There are new updates available. Click here to update now!",
+-            onClick: () => update(),
+-        }), 15_000);
+-}
