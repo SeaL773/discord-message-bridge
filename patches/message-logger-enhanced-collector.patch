@@ -10,9 +10,9 @@ index 0000000000000000000000000000000000000000..0795105dc7d83c4f53290446bb262e88
 +
 +Modifier: `SeaL773`
 +
-+Modification date: `2026-07-24`
++Modification date: `2026-08-05`
 +
-+Purpose: adapt the GPL-3.0-or-later MessageLoggerEnhanced source into a reviewed, local-only Bridge collector with privacy-by-default opt-in, mandatory validated channel scoping before NDJSON writes, serialized/rotated integration journals, permission-independent channel/thread context-menu historical backfill with local-only feedback, an optional slash-command trigger, full privacy filtering and retryable CREATED-journal markers, complete local Clear All semantics, current Vencord compatibility, safer embed normalization, and removal of the third-party updater. Upstream copyright and license notices remain in place.
++Purpose: adapt the GPL-3.0-or-later MessageLoggerEnhanced source into a reviewed, local-only Bridge collector with privacy-by-default opt-in, mandatory validated channel scoping before NDJSON writes, serialized/rotated integration journals, permission-independent channel/thread context-menu historical backfill with local-only feedback, an optional slash-command trigger, full privacy filtering and retryable CREATED-journal markers, complete local Clear All semantics, current Vencord compatibility, bounded JSON-safe normalization of embeds, message snapshots, Components V2, and polls, and removal of the third-party updater. Upstream copyright and license notices remain in place.
 +
 +Patch-modified paths:
 +
@@ -2165,10 +2165,91 @@ index d7307080b97ee9992caf60aace97c6bd0c93eda6..1f3337aa3deac111bf6cee6068501593
      fileExtension?: string | null;
      path?: string | null;
 diff --git a/utils/cleanUp.ts b/utils/cleanUp.ts
-index 4e44c3c3119355dec1638260109b3cc6e3bf8a05..83d67c802c7be51d58494738e1fa53bd9650083c 100644
+index 4e44c3c..14a78ff 100644
 --- a/utils/cleanUp.ts
 +++ b/utils/cleanUp.ts
-@@ -56,54 +56,131 @@ export function cleanUpCachedMessage(message: any) {
+@@ -22,88 +22,523 @@ import { MessageStore } from "@webpack/common";
+ import { LoggedMessageJSON, RefrencedMessage } from "../types";
+ import { getGuildIdByChannel, isGhostPinged } from "./index";
+ 
+-export function cleanupMessage(message: any, removeDetails: boolean = true): LoggedMessageJSON {
+-    const ret: LoggedMessageJSON = typeof message.toJS === "function" ? JSON.parse(JSON.stringify(message.toJS())) : { ...message };
++// Modified 2026-08-05 by SeaL773: retain bounded, JSON-safe snapshots,
++// Components V2, and poll content that is visible in modern Discord messages.
++
++export function cleanupMessage(message: unknown, removeDetails: boolean = true): LoggedMessageJSON {
++    const context: CleanupContext = {
++        seenMessages: new WeakSet<object>(),
++        componentNodesRemaining: MAX_COMPONENT_NODES,
++        componentTextRemaining: MAX_COMPONENT_TEXT_TOTAL
++    };
++    const cleaned = cleanupMessageInternal(message, removeDetails, context, 0);
++    if (cleaned == null) throw new Error("Cannot clean a non-object message");
++    return cleaned;
++}
++
++function cleanupMessageInternal(
++    message: unknown,
++    removeDetails: boolean,
++    context: CleanupContext,
++    replyDepth: number
++): LoggedMessageJSON | undefined {
++    if (!isRecord(message) || context.seenMessages.has(message)) return;
++    context.seenMessages.add(message);
++
++    const serialized = typeof message.toJS === "function" ? message.toJS() : message;
++    const cloned = cloneTraditionalMessage(serialized);
++    if (!isRecord(cloned)) return;
++    const ret = cloned as unknown as LoggedMessageJSON;
+     if (removeDetails) {
+-        ret.author.phone = undefined;
+-        ret.author.email = undefined;
++        if (isRecord(ret.author)) {
++            ret.author.phone = undefined;
++            ret.author.email = undefined;
++        }
+     }
+ 
+-    ret.ghostPinged = ret.mentioned ?? isGhostPinged(message);
++    ret.ghostPinged = ret.mentioned ?? isGhostPinged(ret);
+     ret.guildId = ret.guild_id ?? getGuildIdByChannel(ret.channel_id);
+-    ret.embeds = (ret.embeds ?? []).map(cleanupEmbed);
++    ret.embeds = normalizeEmbeds(message.embeds ?? ret.embeds) as unknown as LoggedMessageJSON["embeds"];
++    const cleanRecord = ret as unknown as Record<string, unknown>;
++    replaceVisibleStructure(cleanRecord, message, "components", value => normalizeComponents(value, context));
++    replaceVisibleStructure(cleanRecord, message, "messageSnapshots", value => normalizeMessageSnapshots(value, context));
++    replaceVisibleStructure(cleanRecord, message, "message_snapshots", value => normalizeMessageSnapshots(value, context));
++    replaceVisibleStructure(cleanRecord, message, "poll", normalizePoll);
+     ret.deleted = ret.deleted ?? false;
+     ret.deletedTimestamp = ret.deleted ? (new Date()).toISOString() : undefined;
+     ret.editHistory = ret.editHistory ?? [];
+-    if (ret.type === 19) {
+-        ret.message_reference = message.message_reference || message.messageReference;
+-        if (ret.message_reference) {
+-            if (message.referenced_message) {
+-                ret.referenced_message = cleanupMessage(message.referenced_message) as RefrencedMessage;
+-            } else if (MessageStore.getMessage(ret.message_reference.channel_id, ret.message_reference.message_id)) {
+-                ret.referenced_message = cleanupMessage(MessageStore.getMessage(ret.message_reference.channel_id, ret.message_reference.message_id)) as RefrencedMessage;
+-            }
++    if (ret.type === 19 && replyDepth < MAX_REPLY_DEPTH) {
++        const reference = normalizeMessageReference(message.message_reference ?? message.messageReference);
++        if (reference) {
++            ret.message_reference = reference as unknown as RefrencedMessage;
++            const referenced = message.referenced_message
++                ?? MessageStore.getMessage(reference.channel_id, reference.message_id);
++            const cleanedReference = cleanupMessageInternal(referenced, removeDetails, context, replyDepth + 1);
++            if (cleanedReference) ret.referenced_message = cleanedReference as RefrencedMessage;
+         }
+     }
+ 
+     return ret;
+ }
+ 
+-export function cleanUpCachedMessage(message: any) {
++export function cleanUpCachedMessage(message: unknown) {
+     const ret = cleanupMessage(message, false);
+     ret.ourCache = true;
+     return ret;
  }
  
  // stolen from mlv2
@@ -2176,9 +2257,7 @@ index 4e44c3c3119355dec1638260109b3cc6e3bf8a05..83d67c802c7be51d58494738e1fa53bd
 +export function cleanupEmbed(embed: unknown) {
      /* backported code from MLV2 rewrite */
 -    if (!embed.id) return embed; /* already cleaned */
-+    if (!isRecord(embed)) return embed;
-+
-     const retEmbed: any = {};
+-    const retEmbed: any = {};
 -    if (typeof embed.rawTitle === "string") retEmbed.title = embed.rawTitle;
 -    if (typeof embed.rawDescription === "string") retEmbed.description = embed.rawDescription;
 -    if (typeof embed.referenceId !== "undefined") retEmbed.reference_id = embed.referenceId;
@@ -2197,31 +2276,34 @@ index 4e44c3c3119355dec1638260109b3cc6e3bf8a05..83d67c802c7be51d58494738e1fa53bd
 -                width: embed.thumbnail.width,
 -                height: embed.thumbnail.height
 -            };
-+    setString(retEmbed, "title", embed.rawTitle, embed.title);
-+    setString(retEmbed, "description", embed.rawDescription, embed.description);
-+    setString(retEmbed, "reference_id", embed.referenceId, embed.reference_id);
++    if (!isRecord(embed)) return embed;
++
++    const retEmbed: Record<string, unknown> = {};
++    setBoundedString(retEmbed, "title", MAX_EMBED_TITLE_LENGTH, embed.rawTitle, embed.title);
++    setBoundedString(retEmbed, "description", MAX_EMBED_DESCRIPTION_LENGTH, embed.rawDescription, embed.description);
++    setBoundedString(retEmbed, "reference_id", MAX_TEXT_LENGTH, embed.referenceId, embed.reference_id);
 +    setNumber(retEmbed, "color", embed.color);
-+    setString(retEmbed, "type", embed.type);
-+    setString(retEmbed, "url", embed.url);
++    setBoundedString(retEmbed, "type", MAX_TEXT_LENGTH, embed.type);
++    setBoundedString(retEmbed, "url", MAX_URL_LENGTH, embed.url);
 +
 +    const provider = normalizeTextObject(embed.provider, {
-+        name: ["name"],
-+        url: ["url"]
++        name: { keys: ["name"], maxLength: MAX_EMBED_SHORT_TEXT_LENGTH },
++        url: { keys: ["url"], maxLength: MAX_URL_LENGTH }
 +    });
 +    if (provider) retEmbed.provider = provider;
 +
 +    const footer = normalizeTextObject(embed.footer, {
-+        text: ["text"],
-+        icon_url: ["iconURL", "icon_url"],
-+        proxy_icon_url: ["iconProxyURL", "proxy_icon_url"]
++        text: { keys: ["text"], maxLength: MAX_EMBED_DESCRIPTION_LENGTH },
++        icon_url: { keys: ["iconURL", "icon_url"], maxLength: MAX_URL_LENGTH },
++        proxy_icon_url: { keys: ["iconProxyURL", "proxy_icon_url"], maxLength: MAX_URL_LENGTH }
 +    });
 +    if (footer) retEmbed.footer = footer;
 +
 +    const author = normalizeTextObject(embed.author, {
-+        name: ["name"],
-+        url: ["url"],
-+        icon_url: ["iconURL", "icon_url"],
-+        proxy_icon_url: ["iconProxyURL", "proxy_icon_url"]
++        name: { keys: ["name"], maxLength: MAX_EMBED_SHORT_TEXT_LENGTH },
++        url: { keys: ["url"], maxLength: MAX_URL_LENGTH },
++        icon_url: { keys: ["iconURL", "icon_url"], maxLength: MAX_URL_LENGTH },
++        proxy_icon_url: { keys: ["iconProxyURL", "proxy_icon_url"], maxLength: MAX_URL_LENGTH }
 +    });
 +    if (author) retEmbed.author = author;
 +
@@ -2236,7 +2318,7 @@ index 4e44c3c3119355dec1638260109b3cc6e3bf8a05..83d67c802c7be51d58494738e1fa53bd
 +
 +    if (Array.isArray(embed.images)) {
 +        const images: Record<string, unknown>[] = [];
-+        for (const rawImage of embed.images) {
++        for (const rawImage of embed.images.slice(0, MAX_EMBED_IMAGES)) {
 +            const normalizedImage = normalizeMedia(rawImage);
 +            if (normalizedImage) images.push(normalizedImage);
          }
@@ -2264,12 +2346,12 @@ index 4e44c3c3119355dec1638260109b3cc6e3bf8a05..83d67c802c7be51d58494738e1fa53bd
 +
      if (Array.isArray(embed.fields) && embed.fields.length) {
 -        retEmbed.fields = embed.fields.map(e => ({ name: e.rawName, value: e.rawValue, inline: e.inline }));
-+        retEmbed.fields = embed.fields.map(field => {
++        retEmbed.fields = embed.fields.slice(0, MAX_EMBED_FIELDS).map(field => {
 +            if (!isRecord(field)) return {};
 +
 +            const normalizedField: Record<string, unknown> = {};
-+            setString(normalizedField, "name", field.rawName, field.name);
-+            setString(normalizedField, "value", field.rawValue, field.value);
++            setBoundedString(normalizedField, "name", MAX_EMBED_FIELD_NAME_LENGTH, field.rawName, field.name);
++            setBoundedString(normalizedField, "value", MAX_EMBED_FIELD_VALUE_LENGTH, field.rawValue, field.value);
 +            if (typeof field.inline === "boolean") normalizedField.inline = field.inline;
 +            return normalizedField;
 +        });
@@ -2282,25 +2364,351 @@ index 4e44c3c3119355dec1638260109b3cc6e3bf8a05..83d67c802c7be51d58494738e1fa53bd
 +    return typeof value === "object" && value !== null;
 +}
 +
-+function firstString(...values: unknown[]) {
-+    return values.find((value): value is string => typeof value === "string");
++const MAX_CONTENT_LENGTH = 16_384;
++const MAX_TEXT_LENGTH = 4096;
++const MAX_URL_LENGTH = 2048;
++const MAX_COMPONENT_DEPTH = 4;
++const MAX_COMPONENTS = 25;
++const MAX_COMPONENT_NODES = 160;
++const MAX_COMPONENT_TEXT_TOTAL = 96 * 1024;
++const MAX_SNAPSHOTS = 10;
++const MAX_EMBEDS = 4;
++const MAX_EMBED_FIELDS = 4;
++const MAX_EMBED_IMAGES = 2;
++const MAX_EMBED_TITLE_LENGTH = 1024;
++const MAX_EMBED_DESCRIPTION_LENGTH = 4096;
++const MAX_EMBED_SHORT_TEXT_LENGTH = 512;
++const MAX_EMBED_FIELD_NAME_LENGTH = 512;
++const MAX_EMBED_FIELD_VALUE_LENGTH = 2048;
++const MAX_ATTACHMENTS = 40;
++const MAX_STICKERS = 40;
++const MAX_POLL_ANSWERS = 25;
++const MAX_REPLY_DEPTH = 8;
++const MAX_TRADITIONAL_DEPTH = 12;
++const MAX_TRADITIONAL_ARRAY_ITEMS = 200;
++const MAX_TRADITIONAL_NODES = 5000;
++
++const RECOVERED_MESSAGE_KEYS = new Set([
++    "components",
++    "messageSnapshots",
++    "message_snapshots",
++    "poll",
++    "referenced_message",
++    "messageReference"
++]);
++
++interface CleanupContext {
++    seenMessages: WeakSet<object>;
++    componentNodesRemaining: number;
++    componentTextRemaining: number;
 +}
 +
-+function setString(target: Record<string, unknown>, key: string, ...values: unknown[]) {
-+    const value = firstString(...values);
++interface CloneBudget {
++    nodesRemaining: number;
++    seen: WeakSet<object>;
++}
++
++interface TextFieldSpec {
++    keys: string[];
++    maxLength: number;
++}
++
++function cloneTraditionalMessage(value: unknown) {
++    return cloneJsonSafe(value, 0, {
++        nodesRemaining: MAX_TRADITIONAL_NODES,
++        seen: new WeakSet<object>()
++    }, true);
++}
++
++function cloneJsonSafe(value: unknown, depth: number, budget: CloneBudget, rootMessage: boolean): unknown {
++    if (value === null || typeof value === "boolean" || typeof value === "string") return value;
++    if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
++    if (!isRecord(value) || depth >= MAX_TRADITIONAL_DEPTH || budget.nodesRemaining <= 0 || budget.seen.has(value)) return;
++
++    budget.seen.add(value);
++    budget.nodesRemaining--;
++    if (Array.isArray(value)) {
++        const array: unknown[] = [];
++        for (const item of value.slice(0, MAX_TRADITIONAL_ARRAY_ITEMS)) {
++            const cloned = cloneJsonSafe(item, depth + 1, budget, false);
++            if (cloned !== undefined) array.push(cloned);
++        }
++        return array;
++    }
++
++    const record: Record<string, unknown> = {};
++    for (const [key, item] of Object.entries(value)) {
++        if ((rootMessage && RECOVERED_MESSAGE_KEYS.has(key)) || key === "referenced_message") continue;
++        const cloned = cloneJsonSafe(item, depth + 1, budget, false);
++        if (cloned !== undefined) record[key] = cloned;
++    }
++    return record;
++}
++
++function normalizeMessageReference(value: unknown) {
++    if (!isRecord(value)) return;
++    const reference: Record<string, unknown> = {};
++    setBoundedString(reference, "channel_id", MAX_TEXT_LENGTH, value.channel_id, value.channelId);
++    setBoundedString(reference, "message_id", MAX_TEXT_LENGTH, value.message_id, value.messageId);
++    setBoundedString(reference, "guild_id", MAX_TEXT_LENGTH, value.guild_id, value.guildId);
++    setFiniteNumber(reference, "type", value.type);
++    return typeof reference.channel_id === "string" && typeof reference.message_id === "string"
++        ? reference
++        : undefined;
++}
++
++function boundedString(value: unknown, maxLength: number) {
++    return typeof value === "string" ? value.slice(0, maxLength) : undefined;
++}
++
++function boundedNumber(value: unknown) {
++    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
++}
++
++function setBoundedString(target: Record<string, unknown>, key: string, maxLength: number, ...values: unknown[]) {
++    for (const value of values) {
++        const normalized = boundedString(value, maxLength);
++        if (normalized !== undefined) {
++            target[key] = normalized;
++            return;
++        }
++    }
++}
++
++function setFiniteNumber(target: Record<string, unknown>, key: string, ...values: unknown[]) {
++    for (const value of values) {
++        const normalized = boundedNumber(value);
++        if (normalized !== undefined) {
++            target[key] = normalized;
++            return;
++        }
++    }
++}
++
++function setBoolean(target: Record<string, unknown>, key: string, ...values: unknown[]) {
++    const value = values.find((candidate): candidate is boolean => typeof candidate === "boolean");
 +    if (value !== undefined) target[key] = value;
++}
++
++function takeComponentString(context: CleanupContext, value: unknown, maxLength: number) {
++    if (context.componentTextRemaining <= 0) return;
++    const normalized = boundedString(value, Math.min(maxLength, context.componentTextRemaining));
++    if (normalized === undefined) return;
++    context.componentTextRemaining -= normalized.length;
++    return normalized;
++}
++
++function setComponentString(context: CleanupContext, target: Record<string, unknown>, key: string, maxLength: number, ...values: unknown[]) {
++    for (const value of values) {
++        const normalized = takeComponentString(context, value, maxLength);
++        if (normalized !== undefined) {
++            target[key] = normalized;
++            return;
++        }
++    }
++}
++
++function replaceVisibleStructure(
++    target: Record<string, unknown>,
++    source: Record<string, unknown>,
++    key: string,
++    normalize: (value: unknown) => unknown
++) {
++    const value = source[key] ?? target[key];
++    if (value === undefined) return;
++
++    const normalized = normalize(value);
++    if (normalized === undefined) delete target[key];
++    else target[key] = normalized;
++}
++
++function normalizeEmbeds(value: unknown) {
++    if (!Array.isArray(value)) return [];
++    return value.slice(0, MAX_EMBEDS).map(cleanupEmbed);
++}
++
++function normalizeEmoji(value: unknown) {
++    if (!isRecord(value)) return;
++    const emoji: Record<string, unknown> = {};
++    setBoundedString(emoji, "id", MAX_TEXT_LENGTH, value.id);
++    setBoundedString(emoji, "name", MAX_TEXT_LENGTH, value.name);
++    setBoolean(emoji, "animated", value.animated);
++    return Object.keys(emoji).length ? emoji : undefined;
++}
++
++function normalizeMediaReference(value: unknown, context: CleanupContext) {
++    if (!isRecord(value)) return;
++    const media: Record<string, unknown> = {};
++    setComponentString(context, media, "url", MAX_URL_LENGTH, value.url);
++    setComponentString(context, media, "proxy_url", MAX_URL_LENGTH, value.proxyURL, value.proxy_url);
++    setComponentString(context, media, "content_type", MAX_TEXT_LENGTH, value.contentType, value.content_type);
++    setComponentString(context, media, "placeholder", MAX_TEXT_LENGTH, value.placeholder);
++    setFiniteNumber(media, "width", value.width);
++    setFiniteNumber(media, "height", value.height);
++    return Object.keys(media).length ? media : undefined;
++}
++
++function normalizeComponent(value: unknown, depth: number, context: CleanupContext): Record<string, unknown> | undefined {
++    if (!isRecord(value) || depth >= MAX_COMPONENT_DEPTH || context.componentNodesRemaining <= 0) return;
++    context.componentNodesRemaining--;
++
++    const component: Record<string, unknown> = {};
++    setFiniteNumber(component, "type", value.type);
++    setFiniteNumber(component, "id", value.id);
++    setFiniteNumber(component, "style", value.style);
++    setFiniteNumber(component, "accent_color", value.accentColor, value.accent_color);
++    setFiniteNumber(component, "min_values", value.minValues, value.min_values);
++    setFiniteNumber(component, "max_values", value.maxValues, value.max_values);
++    setComponentString(context, component, "content", MAX_TEXT_LENGTH, value.content);
++    setComponentString(context, component, "label", MAX_TEXT_LENGTH, value.label);
++    setComponentString(context, component, "description", MAX_TEXT_LENGTH, value.description);
++    setComponentString(context, component, "placeholder", MAX_TEXT_LENGTH, value.placeholder);
++    setComponentString(context, component, "url", MAX_URL_LENGTH, value.url);
++    setBoolean(component, "disabled", value.disabled);
++    setBoolean(component, "required", value.required);
++    setBoolean(component, "spoiler", value.spoiler);
++
++    const emoji = normalizeEmoji(value.emoji);
++    if (emoji) component.emoji = emoji;
++    const media = normalizeMediaReference(value.media, context);
++    if (media) component.media = media;
++    const thumbnail = normalizeMediaReference(value.thumbnail, context);
++    if (thumbnail) component.thumbnail = thumbnail;
++    const file = normalizeMediaReference(value.file, context);
++    if (file) component.file = file;
++
++    for (const key of ["components", "items", "options"] as const) {
++        if (!Array.isArray(value[key])) continue;
++        const children = value[key]
++            .slice(0, MAX_COMPONENTS)
++            .map(child => normalizeComponent(child, depth + 1, context))
++            .filter((child): child is Record<string, unknown> => child !== undefined);
++        if (children.length) component[key] = children;
++    }
++
++    const accessory = normalizeComponent(value.accessory, depth + 1, context);
++    if (accessory) component.accessory = accessory;
++    return Object.keys(component).length ? component : undefined;
++}
++
++function normalizeComponents(value: unknown, context: CleanupContext) {
++    if (!Array.isArray(value)) return;
++    return value
++        .slice(0, MAX_COMPONENTS)
++        .map(component => normalizeComponent(component, 0, context))
++        .filter((component): component is Record<string, unknown> => component !== undefined);
++}
++
++function normalizeAttachment(value: unknown) {
++    if (!isRecord(value)) return;
++    const attachment: Record<string, unknown> = {};
++    setBoundedString(attachment, "id", MAX_TEXT_LENGTH, value.id);
++    setBoundedString(attachment, "filename", MAX_TEXT_LENGTH, value.filename);
++    setBoundedString(attachment, "title", MAX_TEXT_LENGTH, value.title);
++    setBoundedString(attachment, "description", MAX_TEXT_LENGTH, value.description);
++    setBoundedString(attachment, "content_type", MAX_TEXT_LENGTH, value.contentType, value.content_type);
++    setBoundedString(attachment, "url", MAX_URL_LENGTH, value.url);
++    setBoundedString(attachment, "proxy_url", MAX_URL_LENGTH, value.proxyURL, value.proxy_url);
++    setBoundedString(attachment, "placeholder", MAX_TEXT_LENGTH, value.placeholder);
++    setFiniteNumber(attachment, "size", value.size);
++    setFiniteNumber(attachment, "width", value.width);
++    setFiniteNumber(attachment, "height", value.height);
++    setFiniteNumber(attachment, "flags", value.flags);
++    setFiniteNumber(attachment, "duration_secs", value.durationSecs, value.duration_secs);
++    setBoolean(attachment, "ephemeral", value.ephemeral);
++    return Object.keys(attachment).length ? attachment : undefined;
++}
++
++function normalizeSticker(value: unknown) {
++    if (!isRecord(value)) return;
++    const sticker: Record<string, unknown> = {};
++    setBoundedString(sticker, "id", MAX_TEXT_LENGTH, value.id);
++    setBoundedString(sticker, "name", MAX_TEXT_LENGTH, value.name);
++    setBoundedString(sticker, "description", MAX_TEXT_LENGTH, value.description);
++    setFiniteNumber(sticker, "format_type", value.formatType, value.format_type);
++    return Object.keys(sticker).length ? sticker : undefined;
++}
++
++function normalizePollMedia(value: unknown) {
++    if (!isRecord(value)) return;
++    const media: Record<string, unknown> = {};
++    setBoundedString(media, "text", MAX_TEXT_LENGTH, value.text);
++    const emoji = normalizeEmoji(value.emoji);
++    if (emoji) media.emoji = emoji;
++    return Object.keys(media).length ? media : undefined;
++}
++
++function normalizePoll(value: unknown) {
++    if (!isRecord(value)) return;
++    const poll: Record<string, unknown> = {};
++    const question = normalizePollMedia(value.question);
++    if (question) poll.question = question;
++    if (Array.isArray(value.answers)) {
++        poll.answers = value.answers.slice(0, MAX_POLL_ANSWERS).flatMap(answer => {
++            if (!isRecord(answer)) return [];
++            const normalized: Record<string, unknown> = {};
++            setFiniteNumber(normalized, "answer_id", answer.answerId, answer.answer_id);
++            const pollMedia = normalizePollMedia(answer.pollMedia ?? answer.poll_media);
++            if (pollMedia) normalized.poll_media = pollMedia;
++            return Object.keys(normalized).length ? [normalized] : [];
++        });
++    }
++    setBoundedString(poll, "expiry", MAX_TEXT_LENGTH, value.expiry);
++    setBoolean(poll, "allow_multiselect", value.allowMultiselect, value.allow_multiselect);
++    setFiniteNumber(poll, "layout_type", value.layoutType, value.layout_type);
++    return Object.keys(poll).length ? poll : undefined;
++}
++
++function normalizeSnapshotMessage(value: unknown, context: CleanupContext) {
++    if (!isRecord(value)) return;
++    const message: Record<string, unknown> = {};
++    setBoundedString(message, "content", MAX_CONTENT_LENGTH, value.content);
++    const embeds = normalizeEmbeds(value.embeds);
++    if (embeds.length) message.embeds = embeds;
++    const components = normalizeComponents(value.components, context);
++    if (components?.length) message.components = components;
++    if (Array.isArray(value.attachments)) {
++        const attachments = value.attachments.slice(0, MAX_ATTACHMENTS).flatMap(attachment => {
++            const normalized = normalizeAttachment(attachment);
++            return normalized ? [normalized] : [];
++        });
++        if (attachments.length) message.attachments = attachments;
++    }
++    if (Array.isArray(value.stickers)) {
++        const stickers = value.stickers.slice(0, MAX_STICKERS).flatMap(sticker => {
++            const normalized = normalizeSticker(sticker);
++            return normalized ? [normalized] : [];
++        });
++        if (stickers.length) message.stickers = stickers;
++    }
++    const poll = normalizePoll(value.poll);
++    if (poll) message.poll = poll;
++    return Object.keys(message).length ? message : undefined;
++}
++
++function normalizeMessageSnapshots(value: unknown, context: CleanupContext) {
++    if (!Array.isArray(value)) return;
++    return value.slice(0, MAX_SNAPSHOTS).flatMap(snapshot => {
++        if (!isRecord(snapshot)) return [];
++        const message = normalizeSnapshotMessage(snapshot.message ?? snapshot, context);
++        return message ? [{ message }] : [];
++    });
++}
++
++function firstString(...values: unknown[]) {
++    return values.find((value): value is string => typeof value === "string");
 +}
 +
 +function setNumber(target: Record<string, unknown>, key: string, value: unknown) {
 +    if (typeof value === "number") target[key] = value;
 +}
 +
-+function normalizeTextObject(value: unknown, fields: Record<string, string[]>) {
++function normalizeTextObject(value: unknown, fields: Record<string, TextFieldSpec>) {
 +    if (!isRecord(value)) return;
 +
 +    const normalized: Record<string, unknown> = {};
-+    for (const [outputKey, inputKeys] of Object.entries(fields)) {
-+        setString(normalized, outputKey, ...inputKeys.map(inputKey => value[inputKey]));
++    for (const [outputKey, spec] of Object.entries(fields)) {
++        setBoundedString(normalized, outputKey, spec.maxLength, ...spec.keys.map(inputKey => value[inputKey]));
 +    }
 +    return Object.keys(normalized).length ? normalized : undefined;
 +}
@@ -2322,12 +2730,12 @@ index 4e44c3c3119355dec1638260109b3cc6e3bf8a05..83d67c802c7be51d58494738e1fa53bd
 +    const proxyUrl = classProxyUrl ?? firstString(value.proxy_url);
 +
 +    const normalized: Record<string, unknown> = {};
-+    if (url !== undefined) normalized.url = url;
-+    if (proxyUrl !== undefined) normalized.proxy_url = stripProxyFormat && classProxyUrl !== undefined ? proxyUrl.split("?format")[0] : proxyUrl;
++    if (url !== undefined) normalized.url = url.slice(0, MAX_URL_LENGTH);
++    if (proxyUrl !== undefined) normalized.proxy_url = (stripProxyFormat && classProxyUrl !== undefined ? proxyUrl.split("?format")[0] : proxyUrl).slice(0, MAX_URL_LENGTH);
 +    setNumber(normalized, "width", value.width);
 +    setNumber(normalized, "height", value.height);
-+    setString(normalized, "content_type", value.contentType, value.content_type);
-+    setString(normalized, "description", value.description);
++    setBoundedString(normalized, "content_type", MAX_TEXT_LENGTH, value.contentType, value.content_type);
++    setBoundedString(normalized, "description", MAX_TEXT_LENGTH, value.description);
 +    return Object.keys(normalized).length ? normalized : undefined;
 +}
 +
@@ -2337,7 +2745,7 @@ index 4e44c3c3119355dec1638260109b3cc6e3bf8a05..83d67c802c7be51d58494738e1fa53bd
      /* backported from MLV2 rewrite */
      return {
          discriminator: user.discriminator,
-@@ -111,6 +188,6 @@ export function cleanupUserObject(user: User) {
+@@ -111,6 +546,6 @@ export function cleanupUserObject(user: User) {
          avatar: user.avatar,
          id: user.id,
          bot: user.bot,

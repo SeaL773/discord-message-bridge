@@ -196,6 +196,263 @@ async function loadTypeScriptHelper(contents) {
   return import(`data:text/javascript;base64,${Buffer.from(javascript).toString("base64")}`);
 }
 
+async function loadCleanupHelper(contents) {
+  const withoutImports = contents.replace(/^import[\s\S]*?;\s*$/gm, "");
+  return loadTypeScriptHelper(`
+    const MessageStore = { getMessage: () => undefined };
+    const getGuildIdByChannel = () => "guild";
+    const isGhostPinged = () => false;
+    ${withoutImports}
+  `);
+}
+
+function makeCleanupBase(overrides = {}) {
+  return {
+    id: "100",
+    channel_id: "200",
+    guild_id: "300",
+    timestamp: "2026-08-05T12:00:00.000Z",
+    type: 0,
+    content: "base content",
+    author: { id: "400", username: "visible", phone: "private", email: "private@example.com" },
+    embeds: [],
+    attachments: [],
+    stickers: [],
+    ...overrides
+  };
+}
+
+function countComponentNodes(value) {
+  if (!Array.isArray(value)) return 0;
+  let count = 0;
+  const pending = value.slice();
+  while (pending.length > 0) {
+    const node = pending.pop();
+    if (typeof node !== "object" || node === null) continue;
+    count++;
+    for (const key of ["components", "items", "options"]) {
+      if (Array.isArray(node[key])) pending.push(...node[key]);
+    }
+    if (typeof node.accessory === "object" && node.accessory !== null) pending.push(node.accessory);
+  }
+  return count;
+}
+
+function makeBranchingComponent(depth, width, prefix = "node") {
+  const node = { type: 17, content: `${prefix}:${"x".repeat(200)}` };
+  if (depth <= 0) return node;
+  node.components = Array.from({ length: width }, (_, index) => makeBranchingComponent(depth - 1, width, `${prefix}-c${index}`));
+  node.items = Array.from({ length: width }, (_, index) => makeBranchingComponent(depth - 1, width, `${prefix}-i${index}`));
+  node.options = Array.from({ length: width }, (_, index) => makeBranchingComponent(depth - 1, width, `${prefix}-o${index}`));
+  node.accessory = makeBranchingComponent(depth - 1, width, `${prefix}-a`);
+  return node;
+}
+
+async function assertCleanupMessageVisibleStructures(cleanupContents) {
+  if (/@ts-ignore|@ts-expect-error|\bas any\b/.test(cleanupContents))
+    throw new Error("Cleanup implementation must not contain type suppressions or any casts");
+
+  const { cleanupMessage } = await loadCleanupHelper(cleanupContents);
+  if (typeof cleanupMessage !== "function")
+    throw new Error("Cleanup helper must export cleanupMessage");
+
+  class ModernMessage {
+    constructor() {
+      Object.assign(this, makeCleanupBase());
+    }
+
+    toJS() {
+      return makeCleanupBase();
+    }
+
+    get messageSnapshots() {
+      return [{
+        message: {
+          content: "snapshot text",
+          embeds: [{ rawTitle: "snapshot embed", internal: () => "private" }],
+          components: [{ type: 10, content: "snapshot component", customId: "private-id", handler: () => undefined }],
+          attachments: [{ id: "a1", filename: "visible.txt", url: "https://cdn.example/a1", privateState: { token: "private" } }],
+          stickers: [{ id: "s1", name: "visible sticker", formatType: 1, privateState: true }],
+          poll: { question: { text: "snapshot question" }, answers: [{ answerId: 1, pollMedia: { text: "snapshot answer" } }] }
+        },
+        internalCache: { token: "private" }
+      }];
+    }
+
+    get components() {
+      return [{
+        type: 17,
+        id: 7,
+        accentColor: 123,
+        spoiler: true,
+        content: "container content",
+        customId: "private-id",
+        interactionToken: "private-token",
+        components: [{ type: 10, content: "nested text", custom_id: "private-id" }],
+        accessory: { type: 2, label: "Open", url: "https://example.com/open", customId: "private-id" },
+        media: { url: "https://cdn.example/media", proxyURL: "https://proxy.example/media", contentType: "image/png" },
+        callback: () => "private"
+      }];
+    }
+
+    get poll() {
+      return {
+        question: { text: "class question", internal: () => undefined },
+        answers: [{ answerId: 1, pollMedia: { text: "class answer", emoji: { id: "e1", name: "wave" } }, custom_id: "private-id" }],
+        results: { answerCounts: [{ id: 1, count: 9, meVoted: true }], finalized: false },
+        interactionToken: "private-token"
+      };
+    }
+  }
+
+  const camel = cleanupMessage(new ModernMessage());
+  if (camel.author.phone !== undefined || camel.author.email !== undefined)
+    throw new Error("Cleanup must preserve existing author phone/email privacy stripping");
+  if (camel.messageSnapshots?.[0]?.message?.content !== "snapshot text")
+    throw new Error("Camel-case class messageSnapshots content must survive cleanup");
+  if (camel.message_snapshots !== undefined)
+    throw new Error("Camel-case class snapshots must use the canonical messageSnapshots key");
+  if (camel.components?.[0]?.components?.[0]?.content !== "nested text" || camel.components?.[0]?.accessory?.label !== "Open")
+    throw new Error("Components V2 nested content and accessory semantics must survive cleanup");
+  if (camel.components?.[0]?.media?.url !== "https://cdn.example/media")
+    throw new Error("Components V2 media URLs must survive cleanup");
+  if (camel.poll?.question?.text !== "class question" || camel.poll?.answers?.[0]?.poll_media?.text !== "class answer")
+    throw new Error("Camel-case poll question and answer text must survive cleanup");
+  const camelJson = JSON.stringify(camel);
+  for (const forbidden of ["private-id", "private-token", "privateState", "internalCache", "callback", "handler"]) {
+    if (camelJson.includes(forbidden))
+      throw new Error(`Cleanup leaked private or internal component state: ${forbidden}`);
+  }
+
+  const snake = cleanupMessage(makeCleanupBase({
+    message_snapshots: [{ message: { content: "snake snapshot", components: [{ type: 10, content: "snake component", custom_id: "private-id" }] } }],
+    components: [{ type: 12, items: [{ media: { url: "https://cdn.example/snake" }, description: "snake media" }] }],
+    poll: { question: { text: "snake question" }, answers: [{ answer_id: 2, poll_media: { text: "snake answer" } }] }
+  }));
+  if (snake.message_snapshots?.[0]?.message?.content !== "snake snapshot" || snake.messageSnapshots !== undefined)
+    throw new Error("Snake-case API message_snapshots must survive under their source key");
+  if (snake.components?.[0]?.items?.[0]?.media?.url !== "https://cdn.example/snake")
+    throw new Error("Snake-case Components V2 media gallery structure must survive cleanup");
+  if (snake.poll?.question?.text !== "snake question" || snake.poll?.answers?.[0]?.poll_media?.text !== "snake answer")
+    throw new Error("Snake-case poll question and answer text must survive cleanup");
+
+  const branching = cleanupMessage(makeCleanupBase({
+    components: Array.from({ length: 4 }, (_, index) => makeBranchingComponent(4, 2, `root-${index}`)),
+    messageSnapshots: Array.from({ length: 4 }, (_, index) => ({
+      message: {
+        content: `snapshot-${index}`,
+        components: Array.from({ length: 4 }, (_, childIndex) => makeBranchingComponent(4, 2, `snapshot-${index}-${childIndex}`))
+      }
+    }))
+  }));
+  const branchingNodes = countComponentNodes(branching.components)
+    + branching.messageSnapshots.reduce((total, snapshot) => total + countComponentNodes(snapshot.message.components), 0);
+  if (branchingNodes > 160)
+    throw new Error(`Components V2 must share one global node budget across message and snapshots; found ${branchingNodes}`);
+  if (JSON.stringify(branching).length > 350_000)
+    throw new Error("Deep and wide Components V2 branching must remain globally size-bounded");
+
+  const embedText = "e".repeat(20_000);
+  const embedUrl = `https://example.com/${"u".repeat(20_000)}`;
+  const embedPayload = {
+    rawTitle: embedText,
+    rawDescription: embedText,
+    url: embedUrl,
+    provider: { name: embedText, url: embedUrl },
+    footer: { text: embedText, iconURL: embedUrl, iconProxyURL: embedUrl },
+    author: { name: embedText, url: embedUrl, iconURL: embedUrl, iconProxyURL: embedUrl },
+    images: Array.from({ length: 100 }, () => ({ url: embedUrl, proxyURL: embedUrl, description: embedText })),
+    fields: Array.from({ length: 100 }, () => ({ rawName: embedText, rawValue: embedText }))
+  };
+  const boundedEmbeds = cleanupMessage(makeCleanupBase({
+    embeds: Array.from({ length: 100 }, () => embedPayload),
+    messageSnapshots: [{ message: { embeds: Array.from({ length: 100 }, () => embedPayload) } }]
+  }));
+  const topEmbed = boundedEmbeds.embeds[0];
+  const snapshotEmbed = boundedEmbeds.messageSnapshots[0].message.embeds[0];
+  for (const embed of [topEmbed, snapshotEmbed]) {
+    if (embed.title.length > 4096 || embed.description.length > 4096 || embed.provider.name.length > 4096 || embed.url.length > 2048)
+      throw new Error("Embed text and URL fields must be bounded for top-level and snapshot uses");
+    if (embed.fields.length > 4 || embed.images.length > 2 || embed.fields[0].value.length > 2048 || embed.images[0].url.length > 2048)
+      throw new Error("Embed field/image counts and nested text/media URLs must be bounded");
+  }
+  if (boundedEmbeds.embeds.length > 4 || boundedEmbeds.messageSnapshots[0].message.embeds.length > 4 || JSON.stringify(boundedEmbeds).length > 500_000)
+    throw new Error("Embed normalization must prevent oversized top-level and snapshot payloads");
+
+  const reply = cleanupMessage(makeCleanupBase({
+    type: 19,
+    message_reference: { channel_id: "200", message_id: "99" },
+    referenced_message: makeCleanupBase({ id: "99", content: "reply", poll: { question: { text: "reply question" }, answers: [] } })
+  }));
+  if (reply.referenced_message?.poll?.question?.text !== "reply question")
+    throw new Error("Reply recursion must retain modern visible structures");
+  if (reply.referenced_message?.author?.phone !== undefined)
+    throw new Error("Reply recursion must retain privacy stripping");
+
+  let deepReply = makeCleanupBase({ id: "deep-80", content: "deep-end" });
+  for (let depth = 79; depth >= 0; depth--) {
+    deepReply = makeCleanupBase({
+      id: `deep-${depth}`,
+      type: 19,
+      message_reference: { channel_id: "200", message_id: `deep-${depth + 1}` },
+      referenced_message: deepReply
+    });
+  }
+  const cleanedDeepReply = cleanupMessage(deepReply);
+  let replyDepth = 0;
+  let replyCursor = cleanedDeepReply;
+  while (replyCursor?.referenced_message) {
+    replyDepth++;
+    replyCursor = replyCursor.referenced_message;
+    if (replyDepth > 20) throw new Error("Reply cleanup depth must be bounded");
+  }
+
+  const selfCycle = makeCleanupBase({ id: "self", type: 19, message_reference: { channel_id: "200", message_id: "self" } });
+  selfCycle.referenced_message = selfCycle;
+  const cleanedSelfCycle = cleanupMessage(selfCycle);
+  JSON.stringify(cleanedSelfCycle);
+  if (cleanedSelfCycle.referenced_message !== undefined)
+    throw new Error("Self-referential replies must be cut without serializing a cycle");
+
+  const mutualA = makeCleanupBase({ id: "mutual-a", type: 19, message_reference: { channel_id: "200", message_id: "mutual-b" } });
+  const mutualB = makeCleanupBase({ id: "mutual-b", type: 19, message_reference: { channel_id: "200", message_id: "mutual-a" } });
+  mutualA.referenced_message = mutualB;
+  mutualB.referenced_message = mutualA;
+  const cleanedMutual = cleanupMessage(mutualA);
+  JSON.stringify(cleanedMutual);
+  if (cleanedMutual.referenced_message?.referenced_message !== undefined)
+    throw new Error("Mutually referential replies must be cut using shared seen state");
+
+  class CyclicModernMessage extends ModernMessage {
+    constructor() {
+      super();
+      this.internalCycle = this;
+    }
+
+    toJS() {
+      const serialized = makeCleanupBase({ internalCycle: null });
+      serialized.internalCycle = serialized;
+      return serialized;
+    }
+  }
+  const cyclicModern = cleanupMessage(new CyclicModernMessage());
+  JSON.stringify(cyclicModern);
+  if (cyclicModern.internalCycle !== undefined)
+    throw new Error("Traditional message cloning must drop cyclic internal fields before allowlist recovery");
+
+  const oversized = cleanupMessage(makeCleanupBase({
+    components: Array.from({ length: 100 }, (_, index) => ({ type: 10, content: `${index}:${"x".repeat(20_000)}`, components: [{ type: 10, content: "deep", components: [{ type: 10, content: "too deep" }] }] })),
+    messageSnapshots: Array.from({ length: 100 }, (_, index) => ({ message: { content: `snapshot-${index}:${"y".repeat(20_000)}` } })),
+    poll: { question: { text: "q".repeat(20_000) }, answers: Array.from({ length: 100 }, (_, index) => ({ answerId: index, pollMedia: { text: `answer-${index}:${"z".repeat(20_000)}` } })) }
+  }));
+  if (oversized.components.length > 40 || oversized.messageSnapshots.length > 20 || oversized.poll.answers.length > 40)
+    throw new Error("Cleanup must cap component, snapshot, and poll-answer counts");
+  if (oversized.components[0].content.length > 4096 || oversized.messageSnapshots[0].message.content.length > 16_384 || oversized.poll.question.text.length > 4096)
+    throw new Error("Cleanup must cap visible-structure string lengths");
+  if (JSON.stringify(oversized).length > 500_000)
+    throw new Error("Cleanup bounds must prevent oversized modern visible-structure payloads");
+}
+
 function makeDescendingMessages(high, count) {
   return Array.from({ length: count }, (_, index) => ({ id: String(high - index) }));
 }
@@ -494,7 +751,7 @@ async function assertBackfillLifecycleHelper(helperContents) {
 }
 
 async function assertCollectorSemantics(fixture) {
-  const [catalog, db, manager, native, settings, plugin, logsModal, clearHelper, backfillHelper, lifecycleHelper, preparationHelper, executionHelper, coordinatorHelper] = await Promise.all([
+  const [catalog, db, manager, native, settings, plugin, logsModal, cleanupHelper, clearHelper, backfillHelper, lifecycleHelper, preparationHelper, executionHelper, coordinatorHelper] = await Promise.all([
     readFile(path.join(fixture, "channelCatalog.ts"), "utf8"),
     readFile(path.join(fixture, "db.ts"), "utf8"),
     readFile(path.join(fixture, "LoggedMessageManager.ts"), "utf8"),
@@ -502,6 +759,7 @@ async function assertCollectorSemantics(fixture) {
     readFile(path.join(fixture, "settings.tsx"), "utf8"),
     readFile(path.join(fixture, "index.tsx"), "utf8"),
     readFile(path.join(fixture, "components", "LogsModal.tsx"), "utf8"),
+    readFile(path.join(fixture, "utils", "cleanUp.ts"), "utf8"),
     readFile(path.join(fixture, "utils", "clearAllLocalLogs.ts"), "utf8"),
     readFile(path.join(fixture, "backfillPagination.ts"), "utf8"),
     readFile(path.join(fixture, "backfillLifecycle.ts"), "utf8"),
@@ -584,6 +842,7 @@ async function assertCollectorSemantics(fixture) {
   await assertBackfillPreparationHelper(preparationHelper);
   await assertBackfillExecutionHelper(executionHelper);
   await assertMessagePersistenceCoordinator(coordinatorHelper);
+  await assertCleanupMessageVisibleStructures(cleanupHelper);
 
   if (/Failed to refresh channel catalog",\s*(?:error|cause|response)/.test(catalog))
     throw new Error("Catalog refresh failures must not log raw exception or response objects");
