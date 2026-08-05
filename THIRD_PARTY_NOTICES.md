@@ -37,10 +37,10 @@ GPL-3.0-or-later work.
 
 ---
 
-## 3. SeaL773 Modifications (2026-07-20, updated 2026-07-24)
+## 3. SeaL773 Modifications (2026-07-20, updated 2026-08-05)
 
 **Modifier:** SeaL773  
-**Modification dates:** 2026-07-20 and 2026-07-24
+**Modification dates:** 2026-07-20, 2026-07-24, and 2026-08-05
 **Canonical patch path:** `patches/message-logger-enhanced-collector.patch`  
 **Patch manifest:** `BRIDGE_PATCH_NOTICE.md` (embedded in the patch, applied to
 the Vencord working tree)
@@ -83,6 +83,22 @@ local-only Bridge collector. Key changes:
   suppressions.
 - Normalizes Discord `Embed` class objects and API `EmbedJSON` payloads for
   consistent collection.
+- Recovers camelCase class-only `messageSnapshots`, Components V2, and `poll`
+  fields omitted by shallow or `toJS()` serialization while preserving
+  snake_case API `message_snapshots`. The cleanup recursively allowlists only
+  visible JSON-safe snapshot content, embed/component/attachment/sticker/poll
+  data, component semantics and media URLs, and poll question/answer text.
+- Bounds modern visible structures by recursion depth, item count, and string
+  length, and excludes functions, interaction tokens, `custom_id`, and internal
+  client objects rather than serializing arbitrary class state.
+- Uses a single shared Components V2 node/text budget across the entire root
+  message and snapshot tree, including accessories, items, and options, so wide
+  branching cannot multiply per-node limits. Embed normalization is bounded on
+  every path, including snapshot embeds, with capped counts and text/media URLs.
+- Replaces unrestricted class-object serialization with a bounded, cycle-aware
+  JSON-safe clone for traditional fields. Reply normalization shares seen state
+  and enforces a fixed depth while preserving privacy stripping, safely cutting
+  self-references, mutual cycles, and excessive reply chains.
 - Adds `BRIDGE_PATCH_NOTICE.md` inside the patched tree with modifier, date,
   affected paths, and purpose while preserving all upstream copyright and
   license notices.
@@ -175,7 +191,7 @@ include the patched plugin:
 - Preserve all upstream copyright and license notices in the patched source
   files.
 - Identify your modifications and their date (this document and
-  `BRIDGE_PATCH_NOTICE.md` satisfy this for the 2026-07-20 and 2026-07-24 SeaL773 changes;
+  `BRIDGE_PATCH_NOTICE.md` satisfy this for the 2026-07-20, 2026-07-24, and 2026-08-05 SeaL773 changes;
   add a new entry here for any further modifications).
 - Provide the corresponding source and reproducible build instructions for every
   patch or compiled artifact you distribute, as required by GPL-3.0 section 6.
