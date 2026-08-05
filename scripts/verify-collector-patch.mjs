@@ -251,6 +251,11 @@ function makeBranchingComponent(depth, width, prefix = "node") {
 async function assertCleanupMessageVisibleStructures(cleanupContents) {
   if (/@ts-ignore|@ts-expect-error|\bas any\b/.test(cleanupContents))
     throw new Error("Cleanup implementation must not contain type suppressions or any casts");
+  assertMatches(cleanupContents, /interface NormalizedMessageReference \{\s*channel_id: string;\s*message_id: string;\s*guild_id\?: string;\s*type\?: number;\s*\}/, "Cleanup must define an explicit normalized message-reference shape with required string IDs");
+  assertMatches(cleanupContents, /function normalizeMessageReference\(value: unknown\): NormalizedMessageReference \| undefined/, "Message-reference normalization must declare its explicit safe return type");
+  assertMatches(cleanupContents, /return \{\s*channel_id,\s*message_id,\s*\.\.\.\(guildId !== undefined \? \{ guild_id: guildId \} : \{\}\),\s*\.\.\.\(type !== undefined \? \{ type \} : \{\}\)\s*\};/, "Message-reference normalization must construct the typed object only after validating required IDs");
+  if (/message_reference\s*=\s*reference\s+as|MessageStore\.getMessage\([^)]*\bas\b/.test(cleanupContents))
+    throw new Error("Normalized message references must flow into storage and MessageStore without casts");
 
   const { cleanupMessage } = await loadCleanupHelper(cleanupContents);
   if (typeof cleanupMessage !== "function")

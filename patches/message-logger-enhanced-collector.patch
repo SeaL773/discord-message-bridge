@@ -2093,7 +2093,7 @@ index 84b679de2a856fe01be0c5d179915049f88b4da1..f7db2a372a80b573a68f39e59fd3e69d
      },
  
 diff --git a/types.ts b/types.ts
-index d7307080b97ee9992caf60aace97c6bd0c93eda6..1f3337aa3deac111bf6cee6068501593d974c975 100644
+index d730708..d6b8a33 100644
 --- a/types.ts
 +++ b/types.ts
 @@ -1,23 +1,52 @@
@@ -2164,11 +2164,33 @@ index d7307080b97ee9992caf60aace97c6bd0c93eda6..1f3337aa3deac111bf6cee6068501593
  export interface LoggedAttachment extends MessageAttachment {
      fileExtension?: string | null;
      path?: string | null;
+@@ -28,6 +57,12 @@ export interface LoggedAttachment extends MessageAttachment {
+ }
+ 
+ export type RefrencedMessage = LoggedMessageJSON & { message_id: string; };
++export interface LoggedMessageReference {
++    channel_id: string;
++    message_id: string;
++    guild_id?: string;
++    type?: number;
++}
+ export interface LoggedMessageJSON extends Omit<LoggedMessage, "timestamp"> {
+     mention_everyone?: string;
+     guildId?: string;
+@@ -36,7 +71,7 @@ export interface LoggedMessageJSON extends Omit<LoggedMessage, "timestamp"> {
+     timestamp: string;
+     ourCache?: boolean;
+     referenced_message: RefrencedMessage;
+-    message_reference: RefrencedMessage;
++    message_reference: LoggedMessageReference;
+ }
+ 
+ export interface LoggedMessage extends Message {
 diff --git a/utils/cleanUp.ts b/utils/cleanUp.ts
-index 4e44c3c..14a78ff 100644
+index 4e44c3c..19abb91 100644
 --- a/utils/cleanUp.ts
 +++ b/utils/cleanUp.ts
-@@ -22,88 +22,523 @@ import { MessageStore } from "@webpack/common";
+@@ -22,88 +22,534 @@ import { MessageStore } from "@webpack/common";
  import { LoggedMessageJSON, RefrencedMessage } from "../types";
  import { getGuildIdByChannel, isGhostPinged } from "./index";
  
@@ -2234,7 +2256,7 @@ index 4e44c3c..14a78ff 100644
 +    if (ret.type === 19 && replyDepth < MAX_REPLY_DEPTH) {
 +        const reference = normalizeMessageReference(message.message_reference ?? message.messageReference);
 +        if (reference) {
-+            ret.message_reference = reference as unknown as RefrencedMessage;
++            ret.message_reference = reference;
 +            const referenced = message.referenced_message
 +                ?? MessageStore.getMessage(reference.channel_id, reference.message_id);
 +            const cleanedReference = cleanupMessageInternal(referenced, removeDetails, context, replyDepth + 1);
@@ -2413,6 +2435,13 @@ index 4e44c3c..14a78ff 100644
 +    maxLength: number;
 +}
 +
++interface NormalizedMessageReference {
++    channel_id: string;
++    message_id: string;
++    guild_id?: string;
++    type?: number;
++}
++
 +function cloneTraditionalMessage(value: unknown) {
 +    return cloneJsonSafe(value, 0, {
 +        nodesRemaining: MAX_TRADITIONAL_NODES,
@@ -2445,16 +2474,20 @@ index 4e44c3c..14a78ff 100644
 +    return record;
 +}
 +
-+function normalizeMessageReference(value: unknown) {
++function normalizeMessageReference(value: unknown): NormalizedMessageReference | undefined {
 +    if (!isRecord(value)) return;
-+    const reference: Record<string, unknown> = {};
-+    setBoundedString(reference, "channel_id", MAX_TEXT_LENGTH, value.channel_id, value.channelId);
-+    setBoundedString(reference, "message_id", MAX_TEXT_LENGTH, value.message_id, value.messageId);
-+    setBoundedString(reference, "guild_id", MAX_TEXT_LENGTH, value.guild_id, value.guildId);
-+    setFiniteNumber(reference, "type", value.type);
-+    return typeof reference.channel_id === "string" && typeof reference.message_id === "string"
-+        ? reference
-+        : undefined;
++    const channel_id = boundedString(value.channel_id ?? value.channelId, MAX_TEXT_LENGTH);
++    const message_id = boundedString(value.message_id ?? value.messageId, MAX_TEXT_LENGTH);
++    if (channel_id === undefined || message_id === undefined) return;
++
++    const guildId = boundedString(value.guild_id ?? value.guildId, MAX_TEXT_LENGTH);
++    const type = boundedNumber(value.type);
++    return {
++        channel_id,
++        message_id,
++        ...(guildId !== undefined ? { guild_id: guildId } : {}),
++        ...(type !== undefined ? { type } : {})
++    };
 +}
 +
 +function boundedString(value: unknown, maxLength: number) {
@@ -2745,7 +2778,7 @@ index 4e44c3c..14a78ff 100644
      /* backported from MLV2 rewrite */
      return {
          discriminator: user.discriminator,
-@@ -111,6 +546,6 @@ export function cleanupUserObject(user: User) {
+@@ -111,6 +557,6 @@ export function cleanupUserObject(user: User) {
          avatar: user.avatar,
          id: user.id,
          bot: user.bot,
