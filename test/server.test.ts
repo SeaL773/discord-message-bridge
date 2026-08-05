@@ -2,12 +2,23 @@ import assert from "node:assert/strict";
 import { appendFile } from "node:fs/promises";
 import { test } from "node:test";
 import WebSocket from "ws";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { BridgeServer, webSocketBufferExceeded } from "../src/server.js";
 import type { EventTailerTestHooks } from "../src/tailer.js";
 import { makeEvent, tempConfig } from "./helpers.js";
 
 const TOKEN = "test-token-that-is-not-stored-in-real-files";
+
+async function rawHttpRequest(port: number, request: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    const chunks: Buffer[] = [];
+    socket.once("error", reject);
+    socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+    socket.once("close", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    socket.once("connect", () => socket.end(request));
+  });
+}
 
 async function startServer(options: { maxWebSocketBufferedBytes?: number; onError?: (error: unknown) => void; tailerTestHooks?: EventTailerTestHooks } = {}): Promise<{ server: BridgeServer; baseUrl: string; wsUrl: string; eventPath: string }> {
   const { config } = await tempConfig();
@@ -54,6 +65,26 @@ void test("health is public while event replay requires bearer auth", async () =
         : null,
       "cursor_expired"
     );
+  } finally {
+    await instance.server.stop();
+  }
+});
+
+void test("malformed REST and WebSocket request URLs are rejected without stopping the server", async () => {
+  const instance = await startServer();
+  try {
+    const address = instance.server.address();
+    if (address === null) throw new Error("server has no address");
+    const restResponse = await rawHttpRequest(address.port, "GET http://[ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert.match(restResponse, /^HTTP\/1\.1 400 Bad Request\r\n/);
+    assert.match(restResponse, /\r\n\r\n\{"error":"invalid_url"\}$/);
+
+    const upgradeResponse = await rawHttpRequest(
+      address.port,
+      "GET http://[ HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    assert.match(upgradeResponse, /^HTTP\/1\.1 400 Bad Request\r\n/);
+    assert.equal((await fetch(`${instance.baseUrl}/v1/health`)).status, 200);
   } finally {
     await instance.server.stop();
   }

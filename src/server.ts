@@ -32,10 +32,18 @@ function json(response: ServerResponse, status: number, body: unknown): void {
   response.end(payload);
 }
 
-function rejectUpgrade(socket: Duplex, status: 401 | 404): void {
-  const reason = status === 401 ? "Unauthorized" : "Not Found";
+function rejectUpgrade(socket: Duplex, status: 400 | 401 | 404): void {
+  const reason = status === 400 ? "Bad Request" : status === 401 ? "Unauthorized" : "Not Found";
   socket.write(`HTTP/1.1 ${String(status)} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
   socket.destroy();
+}
+
+function parseRequestUrl(requestUrl: string | undefined): URL | null {
+  try {
+    return new URL(requestUrl ?? "/", "http://localhost");
+  } catch {
+    return null;
+  }
 }
 
 function parseLimit(value: string | null): number | null {
@@ -132,7 +140,11 @@ export class BridgeServer {
       json(response, 404, { error: "not_found" });
       return;
     }
-    const url = new URL(request.url ?? "/", "http://localhost");
+    const url = parseRequestUrl(request.url);
+    if (url === null) {
+      json(response, 400, { error: "invalid_url" });
+      return;
+    }
     if (url.pathname === "/v1/health") {
       const health = this.#tailer.health();
       const healthy = health.running && health.consecutive_poll_errors === 0;
@@ -174,7 +186,11 @@ export class BridgeServer {
   }
 
   #handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
-    const url = new URL(request.url ?? "/", "http://localhost");
+    const url = parseRequestUrl(request.url);
+    if (url === null) {
+      rejectUpgrade(socket, 400);
+      return;
+    }
     if (url.pathname !== "/v1/events") {
       rejectUpgrade(socket, 404);
       return;
