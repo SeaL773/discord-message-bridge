@@ -755,8 +755,62 @@ async function assertBackfillLifecycleHelper(helperContents) {
     throw new Error("Finishing the current lease must permit a replacement backfill");
 }
 
+async function assertMessageLimitHelper(helperContents) {
+  if (/^\s*import\s/m.test(helperContents))
+    throw new Error("Message-limit helper must remain import-free");
+  if (/@ts-ignore|@ts-expect-error|\bas any\b/.test(helperContents))
+    throw new Error("Message-limit helper must not contain type suppressions or any casts");
+
+  const helper = await loadTypeScriptHelper(helperContents);
+  const createEnforcer = helper.createMessageLimitEnforcer;
+  const deleteCount = helper.getMessageLimitDeleteCount;
+  if (typeof createEnforcer !== "function" || typeof deleteCount !== "function")
+    throw new Error("Message-limit helper must export its enforcer and delete-count functions");
+
+  let runs = 0;
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const enforce = createEnforcer(async () => {
+    runs++;
+    if (runs === 1) await blocked;
+  });
+  const requests = Array.from({ length: 100 }, () => enforce());
+  if (runs !== 1 || requests.some(request => request !== requests[0]))
+    throw new Error("Concurrent message-limit requests must share one active enforcement");
+  release();
+  await Promise.all(requests);
+  if (runs !== 2)
+    throw new Error("Writes during message-limit enforcement must cause exactly one rerun");
+
+  let attempts = 0;
+  const retryable = createEnforcer(async () => {
+    attempts++;
+    if (attempts === 1) throw new Error("expected cleanup failure");
+  });
+  await retryable().then(
+    () => { throw new Error("Failed message-limit enforcement must reject"); },
+    () => undefined
+  );
+  await retryable();
+  if (attempts !== 2)
+    throw new Error("Message-limit enforcement must permit retry after rejection");
+
+  const cases = [
+    [50000, 50000, 0],
+    [50001, 50000, 501],
+    [101, 100, 2],
+    [5001, 5000, 51],
+    [1000001, 1000000, 1001],
+    [10, 0, 0]
+  ];
+  for (const [current, limit, expected] of cases) {
+    if (deleteCount(current, limit) !== expected)
+      throw new Error(`Unexpected message-limit delete count for current=${current} limit=${limit}`);
+  }
+}
+
 async function assertCollectorSemantics(fixture) {
-  const [catalog, db, manager, native, settings, plugin, logsModal, cleanupHelper, clearHelper, backfillHelper, lifecycleHelper, preparationHelper, executionHelper, coordinatorHelper] = await Promise.all([
+  const [catalog, db, manager, native, settings, plugin, logsModal, cleanupHelper, clearHelper, backfillHelper, lifecycleHelper, preparationHelper, executionHelper, coordinatorHelper, messageLimitHelper] = await Promise.all([
     readFile(path.join(fixture, "channelCatalog.ts"), "utf8"),
     readFile(path.join(fixture, "db.ts"), "utf8"),
     readFile(path.join(fixture, "LoggedMessageManager.ts"), "utf8"),
@@ -770,7 +824,8 @@ async function assertCollectorSemantics(fixture) {
     readFile(path.join(fixture, "backfillLifecycle.ts"), "utf8"),
     readFile(path.join(fixture, "backfillPreparation.ts"), "utf8"),
     readFile(path.join(fixture, "backfillExecution.ts"), "utf8"),
-    readFile(path.join(fixture, "messagePersistenceCoordinator.ts"), "utf8")
+    readFile(path.join(fixture, "messagePersistenceCoordinator.ts"), "utf8"),
+    readFile(path.join(fixture, "messageLimitEnforcer.ts"), "utf8")
   ]);
 
   assertMatches(catalog, /getRequestedEventNames\(channelId: string\): RequestedEventNames \| null/, "Catalog API must explicitly deny absent or out-of-scope channels with null");
@@ -824,6 +879,10 @@ async function assertCollectorSemantics(fixture) {
   assertMatches(db, /created_journaled\?: true/, "IndexedDB records must expose an optional CREATED-journal completion marker");
   assertMatches(db, /hasCreatedEventIDB\([\s\S]*?created_journaled === true/, "CREATED dedupe must use the explicit journal marker");
   assertMatches(db, /markCreatedEventIDB\([\s\S]*?existing == null[\s\S]*?created_journaled: true[\s\S]*?\.\.\.existing, created_journaled: true/, "Marking CREATED success must preserve existing lifecycle records and statuses");
+  assertMatches(db, /getOldestMessageIdsIDB\([\s\S]*?openKeyCursor\(\)[\s\S]*?cursor\.primaryKey[\s\S]*?await tx\.done/, "Message-limit cleanup must read only primary keys in timestamp order and await its transaction");
+  if (/getOldestMessagesIDB/.test(`${db}\n${manager}`))
+    throw new Error("Message-limit cleanup must not load and cache full records selected only for deletion");
+  assertMatches(manager, /createMessageLimitEnforcer\([\s\S]*?getMessageLimitDeleteCount\(currentMessageCount, settings\.store\.messageLimit\)/, "Message-limit cleanup must use coalesced low-watermark enforcement");
   if (/hasMessageIDB/.test(manager))
     throw new Error("Generic message existence must not be used as proof of CREATED journal success");
   assertMatches(manager, /const persistenceCoordinator = createMessagePersistenceCoordinator\(\)/, "All lifecycle writes must share the message-ID persistence coordinator");
@@ -847,6 +906,7 @@ async function assertCollectorSemantics(fixture) {
   await assertBackfillPreparationHelper(preparationHelper);
   await assertBackfillExecutionHelper(executionHelper);
   await assertMessagePersistenceCoordinator(coordinatorHelper);
+  await assertMessageLimitHelper(messageLimitHelper);
   await assertCleanupMessageVisibleStructures(cleanupHelper);
 
   if (/Failed to refresh channel catalog",\s*(?:error|cause|response)/.test(catalog))

@@ -1,18 +1,18 @@
 diff --git a/BRIDGE_PATCH_NOTICE.md b/BRIDGE_PATCH_NOTICE.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..0795105dc7d83c4f53290446bb262e88f65dd74f
+index 0000000..f64c27a
 --- /dev/null
 +++ b/BRIDGE_PATCH_NOTICE.md
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,43 @@
 +# Bridge Collector Patch Modification Notice
 +
 +Upstream: `Syncxv/vc-message-logger-enhanced` commit `ea339bc09d7415ad0f715d60b80ba89ba2d685fa`
 +
 +Modifier: `SeaL773`
 +
-+Modification date: `2026-08-05`
++Modification date: `2026-08-13`
 +
-+Purpose: adapt the GPL-3.0-or-later MessageLoggerEnhanced source into a reviewed, local-only Bridge collector with privacy-by-default opt-in, mandatory validated channel scoping before NDJSON writes, serialized/rotated integration journals, permission-independent channel/thread context-menu historical backfill with local-only feedback, an optional slash-command trigger, full privacy filtering and retryable CREATED-journal markers, complete local Clear All semantics, current Vencord compatibility, bounded JSON-safe normalization of embeds, message snapshots, Components V2, and polls, and removal of the third-party updater. Upstream copyright and license notices remain in place.
++Purpose: adapt the GPL-3.0-or-later MessageLoggerEnhanced source into a reviewed, local-only Bridge collector with privacy-by-default opt-in, mandatory validated channel scoping before NDJSON writes, serialized/rotated integration journals, permission-independent channel/thread context-menu historical backfill with local-only feedback, an optional slash-command trigger, full privacy filtering and retryable CREATED-journal markers, complete local Clear All semantics, current Vencord compatibility, bounded JSON-safe normalization of embeds, message snapshots, Components V2, and polls, coalesced low-watermark IndexedDB retention that avoids renderer cleanup storms, and removal of the third-party updater. Upstream copyright and license notices remain in place.
 +
 +Patch-modified paths:
 +
@@ -28,6 +28,7 @@ index 0000000000000000000000000000000000000000..0795105dc7d83c4f53290446bb262e88
 +- `db.ts`
 +- `index.tsx`
 +- `messagePersistenceCoordinator.ts` (added)
++- `messageLimitEnforcer.ts` (added)
 +- `native/index.ts`
 +- `native/updater.ts` (removed)
 +- `settings.tsx`
@@ -47,7 +48,7 @@ index 0000000000000000000000000000000000000000..0795105dc7d83c4f53290446bb262e88
 +
 +This notice does not replace the upstream `LICENSE` or source-file notices.
 diff --git a/LoggedMessageManager.ts b/LoggedMessageManager.ts
-index e83a30e6147ec31a2f6055100c46c5c8dbec7723..84e8bc783342f6c740512a4371013d695419b1d4 100644
+index e83a30e..96ff8f1 100644
 --- a/LoggedMessageManager.ts
 +++ b/LoggedMessageManager.ts
 @@ -1,44 +1,140 @@
@@ -80,7 +81,8 @@ index e83a30e6147ec31a2f6055100c46c5c8dbec7723..84e8bc783342f6c740512a4371013d69
 +
 +import { Flogger, Native, settings } from ".";
 +import { getRequestedEventNames } from "./channelCatalog";
-+import { addMessageIDB, db, DBMessageStatus, deleteMessagesBulkIDB, getOldestMessagesIDB, hasCreatedEventIDB, markCreatedEventIDB } from "./db";
++import { addMessageIDB, db, DBMessageStatus, deleteMessagesBulkIDB, getOldestMessageIdsIDB, hasCreatedEventIDB, markCreatedEventIDB } from "./db";
++import { createMessageLimitEnforcer, getMessageLimitDeleteCount } from "./messageLimitEnforcer";
 +import { createMessagePersistenceCoordinator } from "./messagePersistenceCoordinator";
  import { LoggedMessage, LoggedMessageJSON } from "./types";
  import { cleanupMessage } from "./utils";
@@ -94,21 +96,20 @@ index e83a30e6147ec31a2f6055100c46c5c8dbec7723..84e8bc783342f6c740512a4371013d69
 +    interrupted: boolean;
 +}
 +
-+async function enforceMessageLimit() {
++const enforceMessageLimit = createMessageLimitEnforcer(async () => {
 +    if (settings.store.messageLimit <= 0)
 +        return;
 +
 +    const currentMessageCount = await db.count("messages");
-+    if (currentMessageCount > settings.store.messageLimit) {
-+        const messagesToDelete = currentMessageCount - settings.store.messageLimit;
-+        if (messagesToDelete <= 0 || messagesToDelete >= settings.store.messageLimit) return;
++    const messagesToDelete = getMessageLimitDeleteCount(currentMessageCount, settings.store.messageLimit);
++    if (messagesToDelete > 0) {
 +
-+        const oldestMessages = await getOldestMessagesIDB(messagesToDelete);
++        const oldestMessageIds = await getOldestMessageIdsIDB(messagesToDelete);
 +
-+        Flogger.info(`Deleting ${messagesToDelete} oldest messages`);
-+        await deleteMessagesBulkIDB(oldestMessages.map(m => m.message_id));
++        Flogger.info(`Deleting ${oldestMessageIds.length} oldest messages`);
++        await deleteMessagesBulkIDB(oldestMessageIds);
 +    }
-+}
++});
 +
 +async function appendCreatedEvent(message: LoggedMessageJSON, capturedAt: string) {
 +    const eventNames = getRequestedEventNames(message.channel_id);
@@ -221,7 +222,7 @@ index e83a30e6147ec31a2f6055100c46c5c8dbec7723..84e8bc783342f6c740512a4371013d69
 +}
 diff --git a/backfillExecution.ts b/backfillExecution.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..d6e360cf231bcd80fd5a70fdd135f48a7837088a
+index 0000000..d6e360c
 --- /dev/null
 +++ b/backfillExecution.ts
 @@ -0,0 +1,40 @@
@@ -267,7 +268,7 @@ index 0000000000000000000000000000000000000000..d6e360cf231bcd80fd5a70fdd135f48a
 +}
 diff --git a/backfillLifecycle.ts b/backfillLifecycle.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..120944d53a2b61b21e2adea66917d81e0c94b6bd
+index 0000000..120944d
 --- /dev/null
 +++ b/backfillLifecycle.ts
 @@ -0,0 +1,55 @@
@@ -328,7 +329,7 @@ index 0000000000000000000000000000000000000000..120944d53a2b61b21e2adea66917d81e
 +}
 diff --git a/backfillPagination.ts b/backfillPagination.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..38f12472696fb824e119996bc07aa4feebf4a754
+index 0000000..38f1247
 --- /dev/null
 +++ b/backfillPagination.ts
 @@ -0,0 +1,95 @@
@@ -429,7 +430,7 @@ index 0000000000000000000000000000000000000000..38f12472696fb824e119996bc07aa4fe
 +}
 diff --git a/backfillPreparation.ts b/backfillPreparation.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..7739e9958e931d56aca3e49d70e3a998b85f22c5
+index 0000000..7739e99
 --- /dev/null
 +++ b/backfillPreparation.ts
 @@ -0,0 +1,53 @@
@@ -488,7 +489,7 @@ index 0000000000000000000000000000000000000000..7739e9958e931d56aca3e49d70e3a998
 +}
 diff --git a/channelCatalog.ts b/channelCatalog.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..1070afaa5390eef70b51d06f1e381beed2347999
+index 0000000..1070afa
 --- /dev/null
 +++ b/channelCatalog.ts
 @@ -0,0 +1,189 @@
@@ -682,7 +683,7 @@ index 0000000000000000000000000000000000000000..1070afaa5390eef70b51d06f1e381bee
 +    };
 +}
 diff --git a/components/LogsModal.tsx b/components/LogsModal.tsx
-index 2157dd369e6a98d1be87855e699be38834faae61..78485002c8dec150caf910f051e30537ae497609 100644
+index 2157dd3..7848500 100644
 --- a/components/LogsModal.tsx
 +++ b/components/LogsModal.tsx
 @@ -4,6 +4,9 @@
@@ -819,7 +820,7 @@ index 2157dd369e6a98d1be87855e699be38834faae61..78485002c8dec150caf910f051e30537
  
 diff --git a/components/UpdaterModal.tsx b/components/UpdaterModal.tsx
 deleted file mode 100644
-index 6f158ab42a29d6712edb9be454a499ff94fdc86e..0000000000000000000000000000000000000000
+index 6f158ab..0000000
 --- a/components/UpdaterModal.tsx
 +++ /dev/null
 @@ -1,150 +0,0 @@
@@ -974,7 +975,7 @@ index 6f158ab42a29d6712edb9be454a499ff94fdc86e..00000000000000000000000000000000
 -
 -export const openUpdaterModal = () => !IS_WEB && openModal(modalProps => <UpdaterModal modalProps={modalProps} />);
 diff --git a/db.ts b/db.ts
-index 27febd91b300e348647d65f0a7151dd3ca4f87a5..55c7640145d8b0aa65149a33e96c2bf58a8d9237 100644
+index 27febd9..bdd7283 100644
 --- a/db.ts
 +++ b/db.ts
 @@ -4,6 +4,7 @@
@@ -1020,7 +1021,29 @@ index 27febd91b300e348647d65f0a7151dd3ca4f87a5..55c7640145d8b0aa65149a33e96c2bf5
  export async function countMessagesIDB() {
      return db.count("messages");
  }
-@@ -175,27 +183,49 @@ export async function getMessagesByChannelAndAfterTimestampIDB(channel_id: strin
+@@ -104,8 +112,19 @@ export async function getMessagesByStatusIDB(status: DBMessageStatus) {
+     return cacheRecords(await db.getAllFromIndex("messages", "by_status", status));
+ }
+ 
+-export async function getOldestMessagesIDB(limit: number) {
+-    return cacheRecords(await db.getAllFromIndex("messages", "by_timestamp", undefined, limit));
++export async function getOldestMessageIdsIDB(limit: number) {
++    const tx = db.transaction("messages", "readonly");
++    const index = tx.store.index("by_timestamp");
++    const messageIds: string[] = [];
++    let cursor = await index.openKeyCursor();
++
++    while (cursor && messageIds.length < limit) {
++        messageIds.push(String(cursor.primaryKey));
++        cursor = await cursor.continue();
++    }
++
++    await tx.done;
++    return messageIds;
+ }
+ 
+ export async function* iterateAllMessagesIDB(batchSize = 100) {
+@@ -175,27 +194,49 @@ export async function getMessagesByChannelAndAfterTimestampIDB(channel_id: strin
  }
  
  export async function addMessageIDB(message: LoggedMessageJSON, status: DBMessageStatus) {
@@ -1080,7 +1103,7 @@ index 27febd91b300e348647d65f0a7151dd3ca4f87a5..55c7640145d8b0aa65149a33e96c2bf5
      ]);
  
 diff --git a/index.tsx b/index.tsx
-index ba255d592df25895d34f5e912593e6d1ea034499..d9bfaf44307c38aa5f3ac12ec83792b3ff9c9d1a 100644
+index ba255d5..d9bfaf4 100644
 --- a/index.tsx
 +++ b/index.tsx
 @@ -4,40 +4,200 @@
@@ -1408,9 +1431,51 @@ index ba255d592df25895d34f5e912593e6d1ea034499..d9bfaf44307c38aa5f3ac12ec83792b3
      }
  });
 -
+diff --git a/messageLimitEnforcer.ts b/messageLimitEnforcer.ts
+new file mode 100644
+index 0000000..212ed85
+--- /dev/null
++++ b/messageLimitEnforcer.ts
+@@ -0,0 +1,36 @@
++/*
++ * Vencord, a Discord client mod
++ * Copyright (c) 2023 Vendicated and contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++export function createMessageLimitEnforcer(enforce: () => Promise<void>) {
++    let pending: Promise<void> | null = null;
++    let rerun = false;
++
++    return function enforceMessageLimit() {
++        if (pending != null) {
++            rerun = true;
++            return pending;
++        }
++
++        pending = (async () => {
++            do {
++                rerun = false;
++                await enforce();
++            } while (rerun);
++        })().finally(() => {
++            pending = null;
++            rerun = false;
++        });
++        return pending;
++    };
++}
++
++export function getMessageLimitDeleteCount(currentCount: number, messageLimit: number) {
++    if (messageLimit <= 0 || currentCount <= messageLimit)
++        return 0;
++
++    const headroom = Math.min(1000, Math.max(1, Math.floor(messageLimit / 100)));
++    return currentCount - Math.max(0, messageLimit - headroom);
++}
 diff --git a/messagePersistenceCoordinator.ts b/messagePersistenceCoordinator.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..fd55adbc10b4761a40e581d206fa6d1c22e836d9
+index 0000000..fd55adb
 --- /dev/null
 +++ b/messagePersistenceCoordinator.ts
 @@ -0,0 +1,81 @@
@@ -1496,7 +1561,7 @@ index 0000000000000000000000000000000000000000..fd55adbc10b4761a40e581d206fa6d1c
 +    return { runExclusive, commitCreated };
 +}
 diff --git a/native/index.ts b/native/index.ts
-index 7973af2dd4929b9957a9080b1157795dbdba8711..c9645b08962aad61db95981efe7dde57b69797c0 100644
+index 7973af2..c9645b0 100644
 --- a/native/index.ts
 +++ b/native/index.ts
 @@ -4,7 +4,11 @@
@@ -1809,7 +1874,7 @@ index 7973af2dd4929b9957a9080b1157795dbdba8711..c9645b08962aad61db95981efe7dde57
      return path.join(await getDefaultNativeDataDir(), "savedImages");
 diff --git a/native/updater.ts b/native/updater.ts
 deleted file mode 100644
-index 9055fc96a104bfd9ec514442f90552443af1d56c..0000000000000000000000000000000000000000
+index 9055fc9..0000000
 --- a/native/updater.ts
 +++ /dev/null
 @@ -1,134 +0,0 @@
@@ -1948,7 +2013,7 @@ index 9055fc96a104bfd9ec514442f90552443af1d56c..00000000000000000000000000000000
 -    }
 -}
 diff --git a/settings.tsx b/settings.tsx
-index 84b679de2a856fe01be0c5d179915049f88b4da1..f7db2a372a80b573a68f39e59fd3e69d9fc49d1c 100644
+index 84b679d..f7db2a3 100644
 --- a/settings.tsx
 +++ b/settings.tsx
 @@ -4,6 +4,9 @@
@@ -2788,7 +2853,7 @@ index 4e44c3c..19abb91 100644
  }
 diff --git a/utils/clearAllLocalLogs.ts b/utils/clearAllLocalLogs.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..cb48ada64783f626279f506b3eff63fa3759b305
+index 0000000..cb48ada
 --- /dev/null
 +++ b/utils/clearAllLocalLogs.ts
 @@ -0,0 +1,26 @@
@@ -2819,7 +2884,7 @@ index 0000000000000000000000000000000000000000..cb48ada64783f626279f506b3eff63fa
 +        throw new AggregateError(errors, "Failed to clear all local logs");
 +}
 diff --git a/utils/idb/async-iterators.ts b/utils/idb/async-iterators.ts
-index 97709e373962ac932f4b9cc4ee4f53e983dc96b3..04bb37ea9fb462e765fbcf1ba37e83289751ba37 100644
+index 97709e3..04bb37e 100644
 --- a/utils/idb/async-iterators.ts
 +++ b/utils/idb/async-iterators.ts
 @@ -20,9 +20,15 @@ const cursorIteratorTraps: ProxyHandler<any> = {
@@ -2840,7 +2905,7 @@ index 97709e373962ac932f4b9cc4ee4f53e983dc96b3..04bb37ea9fb462e765fbcf1ba37e8328
        };
      }
 diff --git a/utils/idb/database-extras.ts b/utils/idb/database-extras.ts
-index 26e6a7e8e4dac80b3502c1d86824dacfdfe3ed01..2a31b63136b0f9ed0cffcc57ea43b42cc312fc25 100644
+index 26e6a7e..2a31b63 100644
 --- a/utils/idb/database-extras.ts
 +++ b/utils/idb/database-extras.ts
 @@ -49,6 +49,11 @@ function getMethod(
@@ -2865,7 +2930,7 @@ index 26e6a7e8e4dac80b3502c1d86824dacfdfe3ed01..2a31b63136b0f9ed0cffcc57ea43b42c
        ])
      )[0];
 diff --git a/utils/idb/wrap-idb-value.ts b/utils/idb/wrap-idb-value.ts
-index 748b0ae529576594f01b41257d47ad51bf4f9b77..a0e0d658c914d2221a00c79d04058fc43bcc7eaa 100644
+index 748b0ae..a0e0d65 100644
 --- a/utils/idb/wrap-idb-value.ts
 +++ b/utils/idb/wrap-idb-value.ts
 @@ -53,7 +53,7 @@ function promisifyRequest<T>(request: IDBRequest<T>): Promise<T> {
@@ -2886,7 +2951,7 @@ index 748b0ae529576594f01b41257d47ad51bf4f9b77..a0e0d658c914d2221a00c79d04058fc4
    // We sometimes generate multiple promises from a single IDBRequest (eg when cursoring), because
    // IDB is weird and a single IDBRequest can yield many responses, so these can't be cached.
 diff --git a/utils/misc.ts b/utils/misc.ts
-index 570b24c1ce67043bbcc9ea3d09a48e4e1a648fb0..1d4d07dc55ff6833a4d049115825f58a2e1f3423 100644
+index 570b24c..1d4d07d 100644
 --- a/utils/misc.ts
 +++ b/utils/misc.ts
 @@ -50,8 +50,7 @@ export const getMessageStatus = (message: LoggedMessageJSON) => {
@@ -2924,7 +2989,7 @@ index 570b24c1ce67043bbcc9ea3d09a48e4e1a648fb0..1d4d07dc55ff6833a4d049115825f58a
          } satisfies PluginNative<typeof import("../native")>;
 diff --git a/utils/native-file-system-adapter/types/src/adapters/sandbox.d.ts b/utils/native-file-system-adapter/types/src/adapters/sandbox.d.ts
 deleted file mode 100644
-index ed6c6ed675b288b331396d6ba1e660551b238496..0000000000000000000000000000000000000000
+index ed6c6ed..0000000
 --- a/utils/native-file-system-adapter/types/src/adapters/sandbox.d.ts
 +++ /dev/null
 @@ -1,44 +0,0 @@
@@ -2973,7 +3038,7 @@ index ed6c6ed675b288b331396d6ba1e660551b238496..00000000000000000000000000000000
 -    close(): Promise<any>;
 -}
 diff --git a/utils/parseQuery.ts b/utils/parseQuery.ts
-index bdfff46aede1c106ebea608544b383cd1a605a33..6a78d87072a2aac8e4977df433f6590797079e3d 100644
+index bdfff46..6a78d87 100644
 --- a/utils/parseQuery.ts
 +++ b/utils/parseQuery.ts
 @@ -87,7 +87,7 @@ export const doesMatch = (type: typeof validIdSearchTypes[number], value: string
@@ -2986,7 +3051,7 @@ index bdfff46aede1c106ebea608544b383cd1a605a33..6a78d87072a2aac8e4977df433f65907
          case "server": {
              const guildId = message.guildId ?? getGuildIdByChannel(message.channel_id);
 diff --git a/utils/saveImage/ImageManager.ts b/utils/saveImage/ImageManager.ts
-index 97ecf273b7fd9cd790a92db20f3dea3601ffe98a..a271e51e707484e5b4fbdb3c43b5b40502167746 100644
+index 97ecf27..a271e51 100644
 --- a/utils/saveImage/ImageManager.ts
 +++ b/utils/saveImage/ImageManager.ts
 @@ -24,9 +24,9 @@ import {
@@ -3001,7 +3066,7 @@ index 97ecf273b7fd9cd790a92db20f3dea3601ffe98a..a271e51e707484e5b4fbdb3c43b5b405
  
  const ImageStore = createStore("MessageLoggerImageData", "MessageLoggerImageStore");
 diff --git a/utils/streamparser-json/tokenizer.ts b/utils/streamparser-json/tokenizer.ts
-index 3efd6c304395c7c6365c0a7c50f971651f170ec7..a26429ed3d2c71a090b6cbdf58227a10fa22a8c4 100644
+index 3efd6c3..a26429e 100644
 --- a/utils/streamparser-json/tokenizer.ts
 +++ b/utils/streamparser-json/tokenizer.ts
 @@ -170,7 +170,6 @@ export default class Tokenizer {
@@ -3055,7 +3120,7 @@ index 3efd6c304395c7c6365c0a7c50f971651f170ec7..a26429ed3d2c71a090b6cbdf58227a10
      // Override me
      throw new TokenizerError(
 diff --git a/utils/streamparser-json/tokenparser.ts b/utils/streamparser-json/tokenparser.ts
-index 4d1c43721851b0faf00b8823cbf4ee420ca7c423..2bf94981c6ba83ab531351e7593ee658e41b34da 100644
+index 4d1c437..2bf9498 100644
 --- a/utils/streamparser-json/tokenparser.ts
 +++ b/utils/streamparser-json/tokenparser.ts
 @@ -143,8 +143,11 @@ export default class TokenParser {
@@ -3082,7 +3147,7 @@ index 4d1c43721851b0faf00b8823cbf4ee420ca7c423..2bf94981c6ba83ab531351e7593ee658
      throw new TokenParserError(
 diff --git a/utils/updater.tsx b/utils/updater.tsx
 deleted file mode 100644
-index cbb92c7184687ad9a900d71378564cb4e0f1a096..0000000000000000000000000000000000000000
+index cbb92c7..0000000
 --- a/utils/updater.tsx
 +++ /dev/null
 @@ -1,112 +0,0 @@
