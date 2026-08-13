@@ -37,10 +37,10 @@ GPL-3.0-or-later work.
 
 ---
 
-## 3. SeaL773 Modifications (2026-07-20, updated 2026-08-05)
+## 3. SeaL773 Modifications (2026-07-20, updated 2026-08-13)
 
 **Modifier:** SeaL773  
-**Modification dates:** 2026-07-20, 2026-07-24, and 2026-08-05
+**Modification dates:** 2026-07-20, 2026-07-24, 2026-08-05, and 2026-08-13
 **Canonical patch path:** `patches/message-logger-enhanced-collector.patch`  
 **Patch manifest:** `BRIDGE_PATCH_NOTICE.md` (embedded in the patch, applied to
 the Vencord working tree)
@@ -99,6 +99,10 @@ local-only Bridge collector. Key changes:
   JSON-safe clone for traditional fields. Reply normalization shares seen state
   and enforces a fixed depth while preserving privacy stripping, safely cutting
   self-references, mutual cycles, and excessive reply chains.
+- Coalesces concurrent IndexedDB retention work, reruns when writes arrive during
+  cleanup, reads only primary keys for deletion candidates, and trims below the
+  configured hard limit with bounded 1% headroom to prevent renderer cleanup
+  storms without changing the event-journal ordering.
 - Adds `BRIDGE_PATCH_NOTICE.md` inside the patched tree with modifier, date,
   affected paths, and purpose while preserving all upstream copyright and
   license notices.
@@ -117,6 +121,7 @@ local-only Bridge collector. Key changes:
 - `db.ts`
 - `index.tsx`
 - `messagePersistenceCoordinator.ts` (added)
+- `messageLimitEnforcer.ts` (added)
 - `native/index.ts`
 - `native/updater.ts` (removed)
 - `settings.tsx`
@@ -191,7 +196,7 @@ include the patched plugin:
 - Preserve all upstream copyright and license notices in the patched source
   files.
 - Identify your modifications and their date (this document and
-  `BRIDGE_PATCH_NOTICE.md` satisfy this for the 2026-07-20, 2026-07-24, and 2026-08-05 SeaL773 changes;
+`BRIDGE_PATCH_NOTICE.md` satisfy this for the 2026-07-20, 2026-07-24, 2026-08-05, and 2026-08-13 SeaL773 changes;
   add a new entry here for any further modifications).
 - Provide the corresponding source and reproducible build instructions for every
   patch or compiled artifact you distribute, as required by GPL-3.0 section 6.
