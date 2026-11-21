@@ -10,7 +10,7 @@ licenses, the modifications made, and the relationship between them.
 ## 1. Vendicated/Vencord
 
 **Repository:** https://github.com/Vendicated/Vencord  
-**Pinned commit:** `4b9c27d905d6255141617546227a56073916ebd4`
+**Pinned commit:** `ce9355e9a93e369c7295fa162ad563f7f97b1ff7`
 **License:** GNU General Public License v3.0 or later (GPL-3.0-or-later)  
 **License text:** https://github.com/Vendicated/Vencord/blob/main/LICENSE
 
@@ -37,10 +37,10 @@ GPL-3.0-or-later work.
 
 ---
 
-## 3. SeaL773 Modifications (2026-07-20, updated 2026-08-13)
+## 3. SeaL773 Modifications (2026-07-20, updated 2026-11-21)
 
 **Modifier:** SeaL773  
-**Modification dates:** 2026-07-20, 2026-07-24, 2026-08-05, and 2026-08-13
+**Modification dates:** 2026-07-20, 2026-07-24, 2026-08-05, 2026-08-13, and 2026-11-21
 **Canonical patch path:** `patches/message-logger-enhanced-collector.patch`  
 **Patch manifest:** `BRIDGE_PATCH_NOTICE.md` (embedded in the patch, applied to
 the Vencord working tree)
@@ -79,8 +79,8 @@ local-only Bridge collector. Key changes:
 - Keeps attachment downloads disabled by default.
 - Removes the third-party plugin updater and pins installation to reviewed
   source.
-- Migrates the plugin to the current Vencord modal API and removes unsafe type
-  suppressions.
+- Migrates the plugin to the current Vencord modal and `showToast` APIs and
+  removes unsafe type suppressions.
 - Normalizes Discord `Embed` class objects and API `EmbedJSON` payloads for
   consistent collection.
 - Recovers camelCase class-only `messageSnapshots`, Components V2, and `poll`
@@ -118,6 +118,7 @@ local-only Bridge collector. Key changes:
 - `channelCatalog.ts`
 - `components/LogsModal.tsx`
 - `components/UpdaterModal.tsx` (removed)
+- `components/settings/FolderSelectInput.tsx`
 - `db.ts`
 - `index.tsx`
 - `messagePersistenceCoordinator.ts` (added)
@@ -128,6 +129,7 @@ local-only Bridge collector. Key changes:
 - `types.ts`
 - `utils/cleanUp.ts`
 - `utils/clearAllLocalLogs.ts` (added)
+- `utils/contextMenu.tsx`
 - `utils/idb/async-iterators.ts`
 - `utils/idb/database-extras.ts`
 - `utils/idb/wrap-idb-value.ts`
@@ -135,6 +137,7 @@ local-only Bridge collector. Key changes:
 - `utils/native-file-system-adapter/types/src/adapters/sandbox.d.ts` (removed)
 - `utils/parseQuery.ts`
 - `utils/saveImage/ImageManager.ts`
+- `utils/settingsUtils.ts`
 - `utils/streamparser-json/tokenizer.ts`
 - `utils/streamparser-json/tokenparser.ts`
 - `utils/updater.tsx` (removed)
@@ -196,7 +199,7 @@ include the patched plugin:
 - Preserve all upstream copyright and license notices in the patched source
   files.
 - Identify your modifications and their date (this document and
-`BRIDGE_PATCH_NOTICE.md` satisfy this for the 2026-07-20, 2026-07-24, 2026-08-05, and 2026-08-13 SeaL773 changes;
+`BRIDGE_PATCH_NOTICE.md` satisfy this for the 2026-07-20, 2026-07-24, 2026-08-05, 2026-08-13, and 2026-11-21 SeaL773 changes;
   add a new entry here for any further modifications).
 - Provide the corresponding source and reproducible build instructions for every
   patch or compiled artifact you distribute, as required by GPL-3.0 section 6.

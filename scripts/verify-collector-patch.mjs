@@ -9,7 +9,7 @@ const execFileAsync = promisify(execFile);
 const bridgeRoot = path.resolve(import.meta.dirname, "..");
 const patchPath = path.join(bridgeRoot, "patches", "message-logger-enhanced-collector.patch");
 const expectedMleCommit = "ea339bc09d7415ad0f715d60b80ba89ba2d685fa";
-const expectedVencordCommit = "4b9c27d905d6255141617546227a56073916ebd4";
+const expectedVencordCommit = "ce9355e9a93e369c7295fa162ad563f7f97b1ff7";
 const removedUpdaterPaths = [
   "components/UpdaterModal.tsx",
   "native/updater.ts",

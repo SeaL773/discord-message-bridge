@@ -31,9 +31,9 @@ The patch:
 - Adds **Clear All Local Logs**, which awaits IndexedDB clearing and serialized, idempotent deletion of `message-events.ndjson` plus `.1`; a running Bridge must be restarted separately to clear its replay buffer.
 - Keeps visible-only clearing limited to currently visible IndexedDB records and labels it accordingly.
 - Removes the third-party plugin updater and pins installation to reviewed source.
-- Migrates the plugin to the current Vencord modal API and removes unsafe type suppressions.
+- Migrates the plugin to the current Vencord modal and `showToast` APIs and removes unsafe type suppressions.
 - Coalesces concurrent IndexedDB message-limit cleanup, reruns after writes during cleanup, selects deletion candidates by key without caching messages or attachments, and trims to a 1% low-watermark headroom capped at 1000 records to avoid renderer cleanup storms.
-- Includes `BRIDGE_PATCH_NOTICE.md` with modifier `SeaL773`, latest modification date `2026-08-13`, affected paths, and purpose while preserving upstream notices.
+- Includes `BRIDGE_PATCH_NOTICE.md` with modifier `SeaL773`, latest modification date `2026-11-21`, affected paths, and purpose while preserving upstream notices.
 
 Apply the patch only to the exact upstream commit documented in the root README. Create an explicit request before enabling collection. Requests are read at plugin start or Discord reconnect, not polled; after creating one while connected, re-enable the plugin or restart Discord. Invalid or failed refreshes do not widen scope. Review the diff before building and injecting Vencord.
 
@@ -53,4 +53,4 @@ Generate requests offline with `node scripts/create-channel-catalog-request.mjs 
 
 Run `pnpm verify:collector-patch -- --mle-fixture <clean-source-path> --vencord <path>` from the Bridge repository. The verifier clones the pinned clean MLE source, applies the patch in a temporary tree, and then verifies canonical LF form, semantics, and clean applicability. Add `--vencord-build` for a temporary full Vencord build. Maintainers can add `--reviewed-fixture <patched-fixture-path>` to compare the complete changed-path set and resulting file contents, including deletions, with a separately reviewed patched worktree.
 
-The upstream repositories, their licenses, the 2026-07-20, 2026-07-24, 2026-08-05, and 2026-08-13 SeaL773 modifications, and distribution obligations are documented in [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) at the repository root. The `BRIDGE_PATCH_NOTICE.md` embedded in the patch (applied to the Vencord working tree) is the per-file modification manifest; it does not replace the upstream `LICENSE` or source-file notices.
+The upstream repositories, their licenses, the 2026-07-20, 2026-07-24, 2026-08-05, 2026-08-13, and 2026-11-21 SeaL773 modifications, and distribution obligations are documented in [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) at the repository root. The `BRIDGE_PATCH_NOTICE.md` embedded in the patch (applied to the Vencord working tree) is the per-file modification manifest; it does not replace the upstream `LICENSE` or source-file notices.

@@ -34,7 +34,7 @@ The bridge consumes an NDJSON file produced by a patched version of `MessageLogg
 
 The patch is based on:
 
-- Vencord commit `4b9c27d905d6255141617546227a56073916ebd4`
+- Vencord commit `ce9355e9a93e369c7295fa162ad563f7f97b1ff7`
 - `Syncxv/vc-message-logger-enhanced` commit `ea339bc09d7415ad0f715d60b80ba89ba2d685fa`
 
 From a Windows terminal:
@@ -42,7 +42,7 @@ From a Windows terminal:
 ```powershell
 git clone https://github.com/Vendicated/Vencord.git
 cd Vencord
-git checkout 4b9c27d905d6255141617546227a56073916ebd4
+git checkout ce9355e9a93e369c7295fa162ad563f7f97b1ff7
 
 git clone https://github.com/Syncxv/vc-message-logger-enhanced.git src/userplugins/messageLoggerEnhanced
 cd src/userplugins/messageLoggerEnhanced
@@ -233,7 +233,7 @@ The Bridge API is not Telegram-specific. Custom consumers can use the same authe
 
 This repository is released under the **GNU General Public License v3.0 or later (GPL-3.0-or-later)**. The full license text is in the root [`LICENSE`](LICENSE) file.
 
-The collector patch modifies [`Syncxv/vc-message-logger-enhanced`](https://github.com/Syncxv/vc-message-logger-enhanced) at commit `ea339bc09d7415ad0f715d60b80ba89ba2d685fa`. That project and [`Vendicated/Vencord`](https://github.com/Vendicated/Vencord) are GPL-3.0-or-later licensed. The patch is a modified source version and remains subject to GPL-3.0-or-later. Upstream repositories, their licenses, the 2026-07-20, 2026-07-24, 2026-08-05, and 2026-08-13 SeaL773 modifications, affected paths, source/build verification, and distribution obligations are documented in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Patch-level details are in [`patches/README.md`](patches/README.md).
+The collector patch modifies [`Syncxv/vc-message-logger-enhanced`](https://github.com/Syncxv/vc-message-logger-enhanced) at commit `ea339bc09d7415ad0f715d60b80ba89ba2d685fa`. That project and [`Vendicated/Vencord`](https://github.com/Vendicated/Vencord) are GPL-3.0-or-later licensed. The patch is a modified source version and remains subject to GPL-3.0-or-later. Upstream repositories, their licenses, the 2026-07-20, 2026-07-24, 2026-08-05, 2026-08-13, and 2026-11-21 SeaL773 modifications, affected paths, source/build verification, and distribution obligations are documented in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Patch-level details are in [`patches/README.md`](patches/README.md).
 
 Before redistributing this repository or compiled Vencord artifacts that include the patched plugin, preserve upstream copyright and license notices, identify your modifications and their date, and provide the corresponding source and build instructions required for the form you distribute. See `THIRD_PARTY_NOTICES.md` section 7 for the full checklist. This is a practical distribution guide, not legal advice.
 

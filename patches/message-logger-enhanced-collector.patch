@@ -1,18 +1,18 @@
 diff --git a/BRIDGE_PATCH_NOTICE.md b/BRIDGE_PATCH_NOTICE.md
 new file mode 100644
-index 0000000..f64c27a
+index 0000000..dfa5315
 --- /dev/null
 +++ b/BRIDGE_PATCH_NOTICE.md
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,46 @@
 +# Bridge Collector Patch Modification Notice
 +
 +Upstream: `Syncxv/vc-message-logger-enhanced` commit `ea339bc09d7415ad0f715d60b80ba89ba2d685fa`
 +
 +Modifier: `SeaL773`
 +
-+Modification date: `2026-08-13`
++Modification date: `2026-11-21`
 +
-+Purpose: adapt the GPL-3.0-or-later MessageLoggerEnhanced source into a reviewed, local-only Bridge collector with privacy-by-default opt-in, mandatory validated channel scoping before NDJSON writes, serialized/rotated integration journals, permission-independent channel/thread context-menu historical backfill with local-only feedback, an optional slash-command trigger, full privacy filtering and retryable CREATED-journal markers, complete local Clear All semantics, current Vencord compatibility, bounded JSON-safe normalization of embeds, message snapshots, Components V2, and polls, coalesced low-watermark IndexedDB retention that avoids renderer cleanup storms, and removal of the third-party updater. Upstream copyright and license notices remain in place.
++Purpose: adapt the GPL-3.0-or-later MessageLoggerEnhanced source into a reviewed, local-only Bridge collector with privacy-by-default opt-in, mandatory validated channel scoping before NDJSON writes, serialized/rotated integration journals, permission-independent channel/thread context-menu historical backfill with local-only feedback, an optional slash-command trigger, full privacy filtering and retryable CREATED-journal markers, complete local Clear All semantics, current Vencord compatibility including the `showToast` toast API, bounded JSON-safe normalization of embeds, message snapshots, Components V2, and polls, coalesced low-watermark IndexedDB retention that avoids renderer cleanup storms, and removal of the third-party updater. Upstream copyright and license notices remain in place.
 +
 +Patch-modified paths:
 +
@@ -25,6 +25,7 @@ index 0000000..f64c27a
 +- `channelCatalog.ts`
 +- `components/LogsModal.tsx`
 +- `components/UpdaterModal.tsx` (removed)
++- `components/settings/FolderSelectInput.tsx`
 +- `db.ts`
 +- `index.tsx`
 +- `messagePersistenceCoordinator.ts` (added)
@@ -35,6 +36,7 @@ index 0000000..f64c27a
 +- `types.ts`
 +- `utils/cleanUp.ts`
 +- `utils/clearAllLocalLogs.ts` (added)
++- `utils/contextMenu.tsx`
 +- `utils/idb/async-iterators.ts`
 +- `utils/idb/database-extras.ts`
 +- `utils/idb/wrap-idb-value.ts`
@@ -42,6 +44,7 @@ index 0000000..f64c27a
 +- `utils/native-file-system-adapter/types/src/adapters/sandbox.d.ts` (removed)
 +- `utils/parseQuery.ts`
 +- `utils/saveImage/ImageManager.ts`
++- `utils/settingsUtils.ts`
 +- `utils/streamparser-json/tokenizer.ts`
 +- `utils/streamparser-json/tokenparser.ts`
 +- `utils/updater.tsx` (removed)
@@ -974,6 +977,39 @@ index 6f158ab..0000000
 -
 -
 -export const openUpdaterModal = () => !IS_WEB && openModal(modalProps => <UpdaterModal modalProps={modalProps} />);
+diff --git a/components/settings/FolderSelectInput.tsx b/components/settings/FolderSelectInput.tsx
+index 0b594f0..5aef888 100644
+--- a/components/settings/FolderSelectInput.tsx
++++ b/components/settings/FolderSelectInput.tsx
+@@ -22,7 +22,7 @@ import { Heading } from "@components/Heading";
+ import { copyWithToast } from "@utils/discord";
+ import { classes } from "@utils/misc";
+ import { findCssClassesLazy } from "@webpack";
+-import { Toasts } from "@webpack/common";
++import { showToast } from "@webpack/common";
+ 
+ import { Native, settings } from "../..";
+ import { DEFAULT_IMAGE_CACHE_DIR } from "../../utils/constants";
+@@ -68,17 +68,9 @@ export function SelectFolderInput({ settingsKey, successMessage }: Props) {
+             const res = await Native.chooseDir(settingsKey);
+             settings.store[settingsKey] = res;
+ 
+-            return Toasts.show({
+-                id: Toasts.genId(),
+-                type: Toasts.Type.SUCCESS,
+-                message: successMessage
+-            });
++            return showToast({ text: successMessage, variant: "success" });
+         } catch (err) {
+-            Toasts.show({
+-                id: Toasts.genId(),
+-                type: Toasts.Type.FAILURE,
+-                message: "Failed to update directory"
+-            });
++            showToast({ text: "Failed to update directory", variant: "critical" });
+         }
+     }
+ 
 diff --git a/db.ts b/db.ts
 index 27febd9..bdd7283 100644
 --- a/db.ts
@@ -2883,6 +2919,32 @@ index 0000000..cb48ada
 +    if (errors.length > 0)
 +        throw new AggregateError(errors, "Failed to clear all local logs");
 +}
+diff --git a/utils/contextMenu.tsx b/utils/contextMenu.tsx
+index 8ccdd80..4505c12 100644
+--- a/utils/contextMenu.tsx
++++ b/utils/contextMenu.tsx
+@@ -7,7 +7,7 @@
+ import { addContextMenuPatch, NavContextMenuPatchCallback, removeContextMenuPatch } from "@api/ContextMenu";
+ import { updateMessage } from "@api/MessageUpdater";
+ import { findStoreLazy } from "@webpack";
+-import { FluxDispatcher, Menu, MessageActions, React, Toasts, UserStore } from "@webpack/common";
++import { FluxDispatcher, Menu, MessageActions, React, showToast, UserStore } from "@webpack/common";
+ 
+ import { openLogModal } from "../components/LogsModal";
+ import { deleteMessageIDB } from "../db";
+@@ -83,11 +83,7 @@ const removeMessageAction = async (props: any) => {
+         }
+     } catch (e) {
+         console.error("Failed to remove message", e);
+-        Toasts.show({
+-            type: Toasts.Type.FAILURE,
+-            message: "Failed to remove message. Check console for details.",
+-            id: Toasts.genId()
+-        });
++        showToast({ text: "Failed to remove message. Check console for details.", variant: "critical" });
+     }
+ };
+ 
 diff --git a/utils/idb/async-iterators.ts b/utils/idb/async-iterators.ts
 index 97709e3..04bb37e 100644
 --- a/utils/idb/async-iterators.ts
@@ -3065,6 +3127,86 @@ index 97ecf27..a271e51 100644
  import { DEFAULT_IMAGE_CACHE_DIR } from "../constants";
  
  const ImageStore = createStore("MessageLoggerImageData", "MessageLoggerImageStore");
+diff --git a/utils/settingsUtils.ts b/utils/settingsUtils.ts
+index 8af2fe0..e3e8051 100644
+--- a/utils/settingsUtils.ts
++++ b/utils/settingsUtils.ts
+@@ -17,7 +17,7 @@
+ */
+ 
+ import { chooseFile as chooseFileWeb } from "@utils/web";
+-import { Toasts } from "@webpack/common";
++import { showToast } from "@webpack/common";
+ 
+ import { Native } from "..";
+ import { addMessagesBulkIDB, iterateAllMessagesIDB } from "../db";
+@@ -48,27 +48,15 @@ export async function importLogs() {
+         }
+ 
+         if (count === 0) {
+-            Toasts.show({
+-                id: Toasts.genId(),
+-                message: "No messages found in log file",
+-                type: Toasts.Type.FAILURE
+-            });
++            showToast({ text: "No messages found in log file", variant: "critical" });
+             return;
+         }
+ 
+-        Toasts.show({
+-            id: Toasts.genId(),
+-            message: `Successfully imported ${count} logs`,
+-            type: Toasts.Type.SUCCESS
+-        });
++        showToast({ text: `Successfully imported ${count} logs`, variant: "success" });
+     } catch (e) {
+         console.error(e);
+ 
+-        Toasts.show({
+-            id: Toasts.genId(),
+-            message: "Error importing logs. Check the console for more information",
+-            type: Toasts.Type.FAILURE
+-        });
++        showToast({ text: "Error importing logs. Check the console for more information", variant: "critical" });
+     }
+ 
+ }
+@@ -95,11 +83,7 @@ export async function exportLogs() {
+             await Native.writeNativeLogChunk(streamId, "\n  ]\n}");
+             await Native.finishNativeLogExport(streamId);
+ 
+-            Toasts.show({
+-                id: Toasts.genId(),
+-                message: "Successfully exported logs",
+-                type: Toasts.Type.SUCCESS
+-            });
++            showToast({ text: "Successfully exported logs", variant: "success" });
+             return;
+         }
+ 
+@@ -134,20 +118,12 @@ export async function exportLogs() {
+             await writer.write(encoder.encode("\n  ]\n}"));
+             await writer.close();
+ 
+-            Toasts.show({
+-                id: Toasts.genId(),
+-                message: `Successfully exported ${count} logs`,
+-                type: Toasts.Type.SUCCESS
+-            });
++            showToast({ text: `Successfully exported ${count} logs`, variant: "success" });
+         }
+     } catch (e) {
+         console.error(e);
+ 
+-        Toasts.show({
+-            id: Toasts.genId(),
+-            message: "Error exporting logs. Check the console for more information",
+-            type: Toasts.Type.FAILURE
+-        });
++        showToast({ text: "Error exporting logs. Check the console for more information", variant: "critical" });
+     }
+ }
+ 
 diff --git a/utils/streamparser-json/tokenizer.ts b/utils/streamparser-json/tokenizer.ts
 index 3efd6c3..a26429e 100644
 --- a/utils/streamparser-json/tokenizer.ts
